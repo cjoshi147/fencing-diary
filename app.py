@@ -1087,6 +1087,10 @@ elif page == "🤺 Current Session":
 elif page == "👤 Opponents":
     st.header("Opponents")
 
+    # --------------------------------------------------------
+    # ADD OPPONENT
+    # --------------------------------------------------------
+
     with st.expander("➕ Add opponent"):
         with st.form(
             "add_opponent",
@@ -1138,6 +1142,7 @@ elif page == "👤 Opponents":
 
     if not opponents:
         st.info("No opponents yet.")
+
     else:
         opponent_names = [
             person["name"]
@@ -1155,17 +1160,22 @@ elif page == "👤 Opponents":
             if person["name"] == selected_name
         )
 
+        selected_id = selected["id"]
+        current_me = get_me()
+
         st.divider()
         st.header(selected["name"])
 
-        current_me = get_me()
+        # ----------------------------------------------------
+        # IDENTIFY USER PROFILE
+        # ----------------------------------------------------
 
         if selected.get("is_me"):
             st.success("⭐ This is your fencer profile.")
         else:
             if current_me:
                 st.caption(
-                    f"Current 'me' profile: {current_me['name']}"
+                    f"Your current profile: {current_me['name']}"
                 )
 
             if st.button(
@@ -1173,7 +1183,6 @@ elif page == "👤 Opponents":
                 type="primary",
                 use_container_width=True,
             ):
-                # Ensure only one opponent row is marked as the user.
                 supabase.table("opponents").update({
                     "is_me": False
                 }).eq(
@@ -1185,7 +1194,7 @@ elif page == "👤 Opponents":
                     "is_me": True
                 }).eq(
                     "id",
-                    selected["id"]
+                    selected_id
                 ).execute()
 
                 st.success(
@@ -1208,62 +1217,519 @@ elif page == "👤 Opponents":
             st.write("**Opponent notes**")
             st.write(selected["notes"])
 
-        opponent_bouts = (
+        # ----------------------------------------------------
+        # LOAD THIS FENCER'S COMPETITION DATA
+        # ----------------------------------------------------
+
+        all_competitions = get_competitions()
+
+        competitions_by_id = {
+            competition["id"]: competition
+            for competition in all_competitions
+        }
+
+        competition_entries = (
             supabase
-            .table("bouts")
+            .table("competition_fencers")
             .select("*")
-            .eq("opponent_id", selected["id"])
-            .order("created_at", desc=True)
+            .eq("opponent_id", selected_id)
             .execute()
             .data
         )
 
-        st.subheader("Head-to-head")
+        competition_bouts = (
+            supabase
+            .table("competition_bouts")
+            .select("*")
+            .or_(
+                f"fencer_a_id.eq.{selected_id},"
+                f"fencer_b_id.eq.{selected_id}"
+            )
+            .order("id")
+            .execute()
+            .data
+        )
 
-        if opponent_bouts:
-            wins = losses = 0
-            total_margin = 0
+        people_by_id = opponent_map()
 
-            for bout in opponent_bouts:
-                margin = (
-                    bout["my_score"]
-                    - bout["opponent_score"]
-                )
-                total_margin += margin
+        # ----------------------------------------------------
+        # HEAD-TO-HEAD AGAINST YOU
+        # ----------------------------------------------------
 
-                if margin > 0:
-                    wins += 1
-                elif margin < 0:
-                    losses += 1
+        st.divider()
+        st.subheader("Head-to-head vs you")
 
-            bout_count = len(opponent_bouts)
-            win_rate = wins / bout_count * 100
-            avg_margin = total_margin / bout_count
+        if not current_me:
+            st.info(
+                "Set one opponent profile as ⭐ Me first. "
+                "Then competition head-to-head results can be calculated."
+            )
 
-            col1, col2 = st.columns(2)
-            col1.metric("Record", f"{wins}W – {losses}L")
-            col2.metric("Win rate", f"{win_rate:.0f}%")
+        elif selected_id == current_me["id"]:
+            st.caption(
+                "This is your own profile, so head-to-head is not applicable."
+            )
 
-            col3, col4 = st.columns(2)
-            col3.metric("Avg margin", f"{avg_margin:+.2f}")
-            col4.metric("Total bouts", bout_count)
-
-            st.subheader("Recent bouts")
-
-            for bout in opponent_bouts[:10]:
-                result = get_result_icon(
-                    bout["my_score"],
-                    bout["opponent_score"],
-                )
-
-                st.write(
-                    f"**{result} {bout['my_score']}–{bout['opponent_score']}**"
-                )
-
-                if bout.get("notes"):
-                    st.caption(bout["notes"])
         else:
-            st.info("No bouts against this opponent yet.")
+            my_id = current_me["id"]
+
+            # Diary/session bouts already represent you vs the selected opponent.
+            diary_bouts = (
+                supabase
+                .table("bouts")
+                .select("*")
+                .eq("opponent_id", selected_id)
+                .order("created_at", desc=True)
+                .execute()
+                .data
+            )
+
+            diary_h2h = []
+
+            for bout in diary_bouts:
+                diary_h2h.append({
+                    "source": "Diary",
+                    "date": clean_text(bout.get("created_at"))[:10],
+                    "competition": "",
+                    "stage": "Session",
+                    "my_score": bout["my_score"],
+                    "their_score": bout["opponent_score"],
+                    "notes": clean_text(bout.get("notes")),
+                })
+
+            # Imported competition bouts involving both you and this opponent.
+            competition_h2h = []
+
+            for bout in competition_bouts:
+                a_id = bout.get("fencer_a_id")
+                b_id = bout.get("fencer_b_id")
+
+                ids = {a_id, b_id}
+
+                if ids != {my_id, selected_id}:
+                    continue
+
+                if a_id == my_id:
+                    my_score = bout["score_a"]
+                    their_score = bout["score_b"]
+                else:
+                    my_score = bout["score_b"]
+                    their_score = bout["score_a"]
+
+                competition = competitions_by_id.get(
+                    bout.get("competition_id"),
+                    {},
+                )
+
+                stage = clean_text(bout.get("stage"))
+
+                if stage == "Poule":
+                    stage_label = (
+                        f"Poule {clean_int(bout.get('poule_number')) or ''}"
+                    ).strip()
+                else:
+                    stage_label = (
+                        clean_text(bout.get("round_name"))
+                        or stage
+                        or "Competition"
+                    )
+
+                competition_h2h.append({
+                    "source": "Competition",
+                    "date": clean_text(
+                        competition.get("competition_date")
+                    ),
+                    "competition": clean_text(
+                        competition.get("name")
+                    ),
+                    "stage": stage_label,
+                    "my_score": my_score,
+                    "their_score": their_score,
+                    "notes": "",
+                })
+
+            combined_h2h = diary_h2h + competition_h2h
+
+            def record_summary(rows):
+                wins = 0
+                losses = 0
+                draws = 0
+                margin_total = 0
+
+                for row in rows:
+                    margin = (
+                        row["my_score"]
+                        - row["their_score"]
+                    )
+
+                    margin_total += margin
+
+                    if margin > 0:
+                        wins += 1
+                    elif margin < 0:
+                        losses += 1
+                    else:
+                        draws += 1
+
+                count = len(rows)
+
+                return {
+                    "wins": wins,
+                    "losses": losses,
+                    "draws": draws,
+                    "count": count,
+                    "win_rate": (
+                        wins / count * 100
+                        if count
+                        else 0
+                    ),
+                    "avg_margin": (
+                        margin_total / count
+                        if count
+                        else 0
+                    ),
+                }
+
+            diary_stats = record_summary(diary_h2h)
+            competition_stats = record_summary(competition_h2h)
+            overall_stats = record_summary(combined_h2h)
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric(
+                    "Overall",
+                    (
+                        f"{overall_stats['wins']}W–"
+                        f"{overall_stats['losses']}L"
+                    ),
+                )
+
+            with col2:
+                st.metric(
+                    "Diary",
+                    (
+                        f"{diary_stats['wins']}W–"
+                        f"{diary_stats['losses']}L"
+                    ),
+                )
+
+            with col3:
+                st.metric(
+                    "Competition",
+                    (
+                        f"{competition_stats['wins']}W–"
+                        f"{competition_stats['losses']}L"
+                    ),
+                )
+
+            col4, col5 = st.columns(2)
+
+            with col4:
+                st.metric(
+                    "Overall win rate",
+                    f"{overall_stats['win_rate']:.0f}%"
+                )
+
+            with col5:
+                st.metric(
+                    "Overall avg margin",
+                    f"{overall_stats['avg_margin']:+.2f}"
+                )
+
+            if not combined_h2h:
+                st.info(
+                    "No diary or imported competition bouts "
+                    "against this fencer yet."
+                )
+
+            else:
+                st.subheader("Recent head-to-head bouts")
+
+                combined_h2h.sort(
+                    key=lambda row: row["date"],
+                    reverse=True,
+                )
+
+                for row in combined_h2h[:15]:
+                    result = get_result_icon(
+                        row["my_score"],
+                        row["their_score"],
+                    )
+
+                    line = (
+                        f"**{result} "
+                        f"{row['my_score']}–"
+                        f"{row['their_score']}**"
+                    )
+
+                    if row["source"] == "Competition":
+                        line += (
+                            f" • {row['competition']}"
+                            f" • {row['stage']}"
+                        )
+                    else:
+                        line += " • Diary/session"
+
+                    st.write(line)
+
+                    if row["date"]:
+                        st.caption(row["date"])
+
+                    if row["notes"]:
+                        st.caption(row["notes"])
+
+        # ----------------------------------------------------
+        # COMPLETE COMPETITION HISTORY FOR THIS FENCER
+        # ----------------------------------------------------
+
+        st.divider()
+        st.subheader("Competition history")
+
+        entries_by_competition = {
+            row["competition_id"]: row
+            for row in competition_entries
+        }
+
+        bouts_by_competition = {}
+
+        for bout in competition_bouts:
+            competition_id = bout.get("competition_id")
+
+            if competition_id not in bouts_by_competition:
+                bouts_by_competition[competition_id] = []
+
+            bouts_by_competition[competition_id].append(bout)
+
+        competition_ids = set(entries_by_competition.keys())
+        competition_ids.update(bouts_by_competition.keys())
+
+        competition_history = []
+
+        for competition_id in competition_ids:
+            competition = competitions_by_id.get(competition_id)
+
+            if not competition:
+                continue
+
+            competition_history.append(
+                (
+                    competition,
+                    entries_by_competition.get(competition_id),
+                    bouts_by_competition.get(competition_id, []),
+                )
+            )
+
+        competition_history.sort(
+            key=lambda item: clean_text(
+                item[0].get("competition_date")
+            ),
+            reverse=True,
+        )
+
+        if not competition_history:
+            st.info(
+                "No imported competition history for this fencer yet."
+            )
+
+        else:
+            for competition, entry, comp_bouts in competition_history:
+                date_label = clean_text(
+                    competition.get("competition_date")
+                )
+
+                event_name = clean_text(
+                    competition.get("event_name")
+                )
+
+                final_place_label = ""
+
+                if entry:
+                    final_place_label = (
+                        clean_text(
+                            entry.get("final_place_label")
+                        )
+                        or (
+                            str(entry["final_place"])
+                            if entry.get("final_place") is not None
+                            else ""
+                        )
+                    )
+
+                title = (
+                    f"{date_label} • {competition['name']}"
+                )
+
+                if final_place_label:
+                    title += f" • #{final_place_label}"
+
+                with st.expander(title):
+                    if event_name:
+                        st.write(f"**{event_name}**")
+
+                    comp_details = [
+                        clean_text(competition.get("weapon")),
+                        clean_text(competition.get("level")),
+                        clean_text(competition.get("location")),
+                    ]
+                    comp_details = [
+                        x
+                        for x in comp_details
+                        if x
+                    ]
+
+                    if comp_details:
+                        st.caption(
+                            " • ".join(comp_details)
+                        )
+
+                    if entry:
+                        placement_bits = []
+
+                        if entry.get("initial_seed"):
+                            placement_bits.append(
+                                f"Initial seed: {entry['initial_seed']}"
+                            )
+
+                        if entry.get("de_seed"):
+                            placement_bits.append(
+                                f"DE seed: {entry['de_seed']}"
+                            )
+
+                        if final_place_label:
+                            field_size = competition.get("field_size")
+
+                            final_text = (
+                                f"Final: {final_place_label}"
+                            )
+
+                            if field_size:
+                                final_text += f" / {field_size}"
+
+                            placement_bits.append(final_text)
+
+                        if placement_bits:
+                            st.write(
+                                " • ".join(placement_bits)
+                            )
+
+                    # Orient every bout from the selected fencer's perspective.
+                    oriented_bouts = []
+
+                    for bout in comp_bouts:
+                        if bout.get("fencer_a_id") == selected_id:
+                            selected_score = bout["score_a"]
+                            opponent_score = bout["score_b"]
+                            opponent_id = bout.get("fencer_b_id")
+                        else:
+                            selected_score = bout["score_b"]
+                            opponent_score = bout["score_a"]
+                            opponent_id = bout.get("fencer_a_id")
+
+                        opponent = people_by_id.get(opponent_id)
+                        opponent_name = (
+                            opponent["name"]
+                            if opponent
+                            else "Unknown"
+                        )
+
+                        stage = clean_text(bout.get("stage"))
+
+                        if stage == "Poule":
+                            stage_label = (
+                                f"Poule "
+                                f"{clean_int(bout.get('poule_number')) or ''}"
+                            ).strip()
+                            sort_stage = 0
+                        else:
+                            stage_label = (
+                                clean_text(bout.get("round_name"))
+                                or "DE"
+                            )
+                            sort_stage = 1
+
+                        oriented_bouts.append({
+                            "stage": stage,
+                            "stage_label": stage_label,
+                            "sort_stage": sort_stage,
+                            "opponent": opponent_name,
+                            "selected_score": selected_score,
+                            "opponent_score": opponent_score,
+                        })
+
+                    poule_rows = [
+                        row
+                        for row in oriented_bouts
+                        if row["stage"] == "Poule"
+                    ]
+
+                    de_rows = [
+                        row
+                        for row in oriented_bouts
+                        if row["stage"] == "DE"
+                    ]
+
+                    if poule_rows:
+                        poule_wins = sum(
+                            1
+                            for row in poule_rows
+                            if (
+                                row["selected_score"]
+                                >
+                                row["opponent_score"]
+                            )
+                        )
+
+                        poule_losses = sum(
+                            1
+                            for row in poule_rows
+                            if (
+                                row["selected_score"]
+                                <
+                                row["opponent_score"]
+                            )
+                        )
+
+                        st.markdown(
+                            f"**Poules — "
+                            f"{poule_wins}W–{poule_losses}L**"
+                        )
+
+                        for row in poule_rows:
+                            result = get_result_icon(
+                                row["selected_score"],
+                                row["opponent_score"],
+                            )
+
+                            st.write(
+                                f"{result} "
+                                f"**{row['selected_score']}–"
+                                f"{row['opponent_score']}** "
+                                f"vs {row['opponent']} "
+                                f"• {row['stage_label']}"
+                            )
+
+                    if de_rows:
+                        st.markdown("**Direct elimination**")
+
+                        for row in de_rows:
+                            result = get_result_icon(
+                                row["selected_score"],
+                                row["opponent_score"],
+                            )
+
+                            st.write(
+                                f"{result} "
+                                f"**{row['selected_score']}–"
+                                f"{row['opponent_score']}** "
+                                f"vs {row['opponent']} "
+                                f"• {row['stage_label']}"
+                            )
+
+                    if not oriented_bouts:
+                        st.caption(
+                            "No scored bouts imported for this competition."
+                        )
 
 
 # ============================================================
