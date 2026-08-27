@@ -1010,6 +1010,636 @@ def calculate_strength_rankings():
 
 
 # ============================================================
+# PERSONAL CURRENT-FORM MODEL
+# ============================================================
+
+# This is deliberately separate from the competition leaderboard.
+# Training bouts can move YOUR current-form estimate, but never alter
+# the objective competition rating of an opponent.
+FORM_TRAINING_K_FACTOR = 28.0
+FORM_TRAINING_HALF_LIFE_DAYS = 75
+FORM_TRAINING_FLOOR = 0.05
+FORM_RECENT_DAYS = 90
+FORM_MARGIN_BONUS_CAP = 0.15
+
+
+def training_recency_weight(session_date, reference_date=None):
+    """Return (weight, age_days) for a training session.
+
+    Training is intended to describe current form, so it decays much faster
+    than competition evidence.
+    """
+    if reference_date is None:
+        reference_date = date.today()
+
+    session_day = parse_competition_date(
+        session_date
+    )
+
+    if session_day is None:
+        return 1.0, 0
+
+    age_days = max(
+        0,
+        (reference_date - session_day).days,
+    )
+
+    decay = 0.5 ** (
+        age_days
+        / FORM_TRAINING_HALF_LIFE_DAYS
+    )
+
+    weight = (
+        FORM_TRAINING_FLOOR
+        + (
+            1.0
+            - FORM_TRAINING_FLOOR
+        )
+        * decay
+    )
+
+    return weight, age_days
+
+
+def training_margin_multiplier(my_score, their_score):
+    """Small score-margin adjustment, capped so W/L remains the main signal."""
+    try:
+        my_score = int(my_score)
+        their_score = int(their_score)
+    except (TypeError, ValueError):
+        return 1.0
+
+    maximum_score = max(
+        my_score,
+        their_score,
+        1,
+    )
+
+    relative_margin = min(
+        1.0,
+        abs(my_score - their_score)
+        / maximum_score,
+    )
+
+    return (
+        1.0
+        + FORM_MARGIN_BONUS_CAP
+        * relative_margin
+    )
+
+
+def actual_bout_score(my_score, their_score):
+    if my_score > their_score:
+        return 1.0
+    if my_score < their_score:
+        return 0.0
+    return 0.5
+
+
+def form_performance_label(actual_points, expected_points, rated_bouts):
+    if not rated_bouts:
+        return "No rated bouts"
+
+    gap_per_bout = (
+        actual_points - expected_points
+    ) / rated_bouts
+
+    if gap_per_bout >= 0.25:
+        return "Excellent"
+    if gap_per_bout >= 0.10:
+        return "Above expectation"
+    if gap_per_bout > -0.10:
+        return "As expected"
+    if gap_per_bout > -0.25:
+        return "Below expectation"
+    return "Well below expectation"
+
+
+def calculate_my_current_form(strength_data=None):
+    """Estimate the user's CURRENT strength from recent training.
+
+    Competition strength remains the objective public-style rating.
+    This model starts from the user's competition rating, then updates only
+    the user's estimate from training/lesson bouts against competition-rated
+    opponents.
+
+    Opponent ratings NEVER move because of training.
+    """
+    me = get_me()
+
+    if not me:
+        return None
+
+    if strength_data is None:
+        strength_data = calculate_strength_rankings()
+
+    sessions = get_sessions()
+    session_by_id = {
+        row["id"]: row
+        for row in sessions
+    }
+
+    bouts = (
+        supabase
+        .table("bouts")
+        .select("*")
+        .order("created_at")
+        .execute()
+        .data
+    )
+
+    bouts_by_session = {}
+
+    for bout in bouts:
+        session_id = bout.get("session_id")
+
+        if session_id is None:
+            continue
+
+        bouts_by_session.setdefault(
+            session_id,
+            [],
+        ).append(bout)
+
+    reference_date = date.today()
+    weapon_results = {}
+
+    for weapon in (
+        "Épée",
+        "Foil",
+        "Sabre",
+    ):
+        weapon_strength = strength_data[
+            weapon
+        ]
+
+        competition_row = (
+            weapon_strength["by_id"].get(
+                me["id"]
+            )
+        )
+
+        competition_rating = (
+            competition_row["rating"]
+            if competition_row
+            else STRENGTH_START_RATING
+        )
+
+        competition_confidence = (
+            competition_row["confidence"]
+            if competition_row
+            else 0.0
+        )
+
+        current_rating = float(
+            competition_rating
+        )
+
+        session_groups = []
+
+        for session_id, session_bouts in bouts_by_session.items():
+            session = session_by_id.get(
+                session_id
+            )
+
+            if not session:
+                continue
+
+            if canonical_weapon(
+                session.get("weapon")
+            ) != weapon:
+                continue
+
+            # Imported competition data is the authoritative competition signal.
+            # Avoid counting a manually logged competition session a second time.
+            if normalize_name(
+                session.get("session_type")
+            ) == "competition":
+                continue
+
+            rated_bouts = []
+
+            for bout in session_bouts:
+                opponent_row = (
+                    weapon_strength[
+                        "by_id"
+                    ].get(
+                        bout.get(
+                            "opponent_id"
+                        )
+                    )
+                )
+
+                if not opponent_row:
+                    continue
+
+                rated_bouts.append(
+                    (
+                        bout,
+                        opponent_row,
+                    )
+                )
+
+            if rated_bouts:
+                session_groups.append(
+                    (
+                        session,
+                        rated_bouts,
+                    )
+                )
+
+        session_groups.sort(
+            key=lambda item: (
+                clean_text(
+                    item[0].get(
+                        "session_date"
+                    )
+                ),
+                item[0].get(
+                    "id",
+                    0,
+                ),
+            )
+        )
+
+        session_summaries = {}
+        history = []
+
+        effective_training_bouts = 0.0
+        total_rated_bouts = 0
+
+        recent_rated_bouts = 0
+        recent_wins = 0
+        recent_losses = 0
+        recent_draws = 0
+        recent_actual_points = 0.0
+        recent_expected_points = 0.0
+
+        for session, rated_bouts in session_groups:
+            recency_weight, age_days = (
+                training_recency_weight(
+                    session.get(
+                        "session_date"
+                    ),
+                    reference_date,
+                )
+            )
+
+            rating_before = (
+                current_rating
+            )
+
+            delta = 0.0
+            expected_points = 0.0
+            actual_points = 0.0
+            opponent_rating_total = 0.0
+
+            session_wins = 0
+            session_losses = 0
+            session_draws = 0
+
+            for bout, opponent_row in rated_bouts:
+                opponent_rating = float(
+                    opponent_row["rating"]
+                )
+
+                expected = expected_score(
+                    rating_before,
+                    opponent_rating,
+                )
+
+                actual = actual_bout_score(
+                    bout["my_score"],
+                    bout["opponent_score"],
+                )
+
+                margin_multiplier = (
+                    training_margin_multiplier(
+                        bout["my_score"],
+                        bout["opponent_score"],
+                    )
+                )
+
+                delta += (
+                    FORM_TRAINING_K_FACTOR
+                    * recency_weight
+                    * margin_multiplier
+                    * (
+                        actual - expected
+                    )
+                )
+
+                expected_points += expected
+                actual_points += actual
+                opponent_rating_total += (
+                    opponent_rating
+                )
+
+                if actual == 1.0:
+                    session_wins += 1
+                elif actual == 0.0:
+                    session_losses += 1
+                else:
+                    session_draws += 1
+
+            current_rating += delta
+
+            rated_count = len(
+                rated_bouts
+            )
+
+            effective_training_bouts += (
+                recency_weight
+                * rated_count
+            )
+
+            total_rated_bouts += rated_count
+
+            if (
+                age_days
+                <= FORM_RECENT_DAYS
+            ):
+                recent_rated_bouts += (
+                    rated_count
+                )
+                recent_wins += (
+                    session_wins
+                )
+                recent_losses += (
+                    session_losses
+                )
+                recent_draws += (
+                    session_draws
+                )
+                recent_actual_points += (
+                    actual_points
+                )
+                recent_expected_points += (
+                    expected_points
+                )
+
+            summary = {
+                "session_id": session["id"],
+                "date": clean_text(
+                    session.get(
+                        "session_date"
+                    )
+                ),
+                "session_type": clean_text(
+                    session.get(
+                        "session_type"
+                    )
+                ),
+                "location": clean_text(
+                    session.get(
+                        "location"
+                    )
+                ),
+                "weapon": weapon,
+                "rated_bouts": rated_count,
+                "wins": session_wins,
+                "losses": session_losses,
+                "draws": session_draws,
+                "actual_points": actual_points,
+                "expected_points": expected_points,
+                "over_expected": (
+                    actual_points
+                    - expected_points
+                ),
+                "average_opponent_rating": (
+                    opponent_rating_total
+                    / rated_count
+                    if rated_count
+                    else 0.0
+                ),
+                "form_before": rating_before,
+                "form_after": current_rating,
+                "form_change": delta,
+                "recency_weight": recency_weight,
+                "age_days": age_days,
+                "label": form_performance_label(
+                    actual_points,
+                    expected_points,
+                    rated_count,
+                ),
+            }
+
+            session_summaries[
+                session["id"]
+            ] = summary
+
+            history.append(
+                summary
+            )
+
+        training_confidence = (
+            100.0
+            * (
+                1.0
+                - 0.5 ** (
+                    effective_training_bouts
+                    / 6.0
+                )
+            )
+            if effective_training_bouts
+            else 0.0
+        )
+
+        training_confidence = min(
+            98.0,
+            training_confidence,
+        )
+
+        if total_rated_bouts:
+            combined_confidence = (
+                100.0
+                * (
+                    1.0
+                    - (
+                        1.0
+                        - competition_confidence
+                        / 100.0
+                    )
+                    * (
+                        1.0
+                        - training_confidence
+                        / 100.0
+                    )
+                )
+            )
+        else:
+            combined_confidence = (
+                competition_confidence
+            )
+
+        leaderboard = (
+            weapon_strength[
+                "leaderboard"
+            ]
+        )
+
+        has_competition_rating = (
+            competition_row
+            is not None
+        )
+
+        has_evidence = (
+            has_competition_rating
+            or total_rated_bouts > 0
+        )
+
+        estimated_rank = None
+        ranking_pool_size = 0
+
+        if has_evidence:
+            other_ratings = [
+                row["rating"]
+                for row in leaderboard
+                if row["fencer_id"]
+                != me["id"]
+            ]
+
+            estimated_rank = (
+                1
+                + sum(
+                    1
+                    for rating in other_ratings
+                    if rating
+                    > current_rating
+                )
+            )
+
+            ranking_pool_size = (
+                len(other_ratings)
+                + 1
+            )
+
+        weapon_results[weapon] = {
+            "has_evidence": has_evidence,
+            "competition_rating": (
+                competition_rating
+            ),
+            "competition_rank": (
+                competition_row["rank"]
+                if competition_row
+                else None
+            ),
+            "competition_confidence": (
+                competition_confidence
+            ),
+            "current_form_rating": (
+                current_rating
+            ),
+            "form_delta": (
+                current_rating
+                - competition_rating
+            ),
+            "estimated_rank": (
+                estimated_rank
+            ),
+            "ranking_pool_size": (
+                ranking_pool_size
+            ),
+            "confidence": min(
+                99.0,
+                combined_confidence,
+            ),
+            "training_confidence": (
+                training_confidence
+            ),
+            "effective_training_bouts": (
+                effective_training_bouts
+            ),
+            "rated_training_bouts": (
+                total_rated_bouts
+            ),
+            "recent_rated_bouts": (
+                recent_rated_bouts
+            ),
+            "recent_wins": recent_wins,
+            "recent_losses": recent_losses,
+            "recent_draws": recent_draws,
+            "recent_actual_points": (
+                recent_actual_points
+            ),
+            "recent_expected_points": (
+                recent_expected_points
+            ),
+            "recent_over_expected": (
+                recent_actual_points
+                - recent_expected_points
+            ),
+            "history": history,
+            "by_session": (
+                session_summaries
+            ),
+        }
+
+    return {
+        "me": me,
+        "weapons": weapon_results,
+    }
+
+
+def my_expected_win_chance(
+    opponent_id,
+    weapon,
+    form_data=None,
+    strength_data=None,
+):
+    """Expected training-bout win chance using MY current form estimate."""
+    if strength_data is None:
+        strength_data = (
+            calculate_strength_rankings()
+        )
+
+    if form_data is None:
+        form_data = (
+            calculate_my_current_form(
+                strength_data
+            )
+        )
+
+    if not form_data:
+        return None
+
+    my_weapon = (
+        form_data[
+            "weapons"
+        ].get(
+            weapon
+        )
+    )
+
+    opponent_row = (
+        strength_data[
+            weapon
+        ]["by_id"].get(
+            opponent_id
+        )
+    )
+
+    if (
+        not my_weapon
+        or not my_weapon[
+            "has_evidence"
+        ]
+        or not opponent_row
+    ):
+        return None
+
+    return expected_score(
+        my_weapon[
+            "current_form_rating"
+        ],
+        opponent_row[
+            "rating"
+        ],
+    )
+
+
+
+# ============================================================
 # IMPORT HELPERS
 # ============================================================
 
@@ -1424,6 +2054,7 @@ page = st.sidebar.radio(
         "👤 Opponents",
         "🏆 Competitions",
         "📈 Strength Rankings",
+        "📊 My Form",
         "📚 Session History",
         "📖 Bout History",
     ],
@@ -1623,6 +2254,120 @@ if page == "🏠 Dashboard":
                     f"{rating_row['bouts']} total bouts • "
                     f"{rating_row['status']}"
                 )
+
+    st.divider()
+    st.subheader("Current form estimate")
+
+    me = get_me()
+
+    if not me:
+        st.info(
+            "Set your own fencer profile in Opponents to calculate "
+            "a current-form estimate."
+        )
+    else:
+        dashboard_strength_data = (
+            calculate_strength_rankings()
+        )
+
+        dashboard_form_data = (
+            calculate_my_current_form(
+                dashboard_strength_data
+            )
+        )
+
+        displayed_form = False
+
+        for weapon_name in (
+            "Épée",
+            "Foil",
+            "Sabre",
+        ):
+            form_row = (
+                dashboard_form_data[
+                    "weapons"
+                ][weapon_name]
+            )
+
+            if not form_row[
+                "has_evidence"
+            ]:
+                continue
+
+            displayed_form = True
+
+            st.markdown(
+                f"**{weapon_name}**"
+            )
+
+            col_a, col_b, col_c = (
+                st.columns(3)
+            )
+
+            with col_a:
+                st.metric(
+                    "Current form",
+                    f"{form_row['current_form_rating']:.0f}",
+                    delta=(
+                        f"{form_row['form_delta']:+.0f} "
+                        "vs competition"
+                    ),
+                )
+
+            with col_b:
+                if form_row[
+                    "estimated_rank"
+                ]:
+                    st.metric(
+                        "Estimated rank",
+                        (
+                            f"#{form_row['estimated_rank']}"
+                            f"/{form_row['ranking_pool_size']}"
+                        ),
+                    )
+                else:
+                    st.metric(
+                        "Estimated rank",
+                        "—",
+                    )
+
+            with col_c:
+                st.metric(
+                    "Confidence",
+                    f"{form_row['confidence']:.0f}%",
+                )
+
+            if form_row[
+                "recent_rated_bouts"
+            ]:
+                st.caption(
+                    f"Last {FORM_RECENT_DAYS}d: "
+                    f"{form_row['recent_wins']}W–"
+                    f"{form_row['recent_losses']}L "
+                    f"across {form_row['recent_rated_bouts']} rated "
+                    f"training bouts • expected "
+                    f"{form_row['recent_expected_points']:.1f} wins • "
+                    f"actual {form_row['recent_actual_points']:.1f} • "
+                    f"{form_row['recent_over_expected']:+.1f} vs expected"
+                )
+            else:
+                st.caption(
+                    "No recent training bouts against competition-rated "
+                    "opponents yet. Current form therefore matches the "
+                    "competition evidence."
+                )
+
+        if not displayed_form:
+            st.caption(
+                "You need either a competition rating or training bouts "
+                "against competition-rated opponents before current form "
+                "can be estimated."
+            )
+
+        st.caption(
+            "Training changes only your private current-form estimate. "
+            "It never changes an opponent's competition strength rating."
+        )
 
     st.divider()
     st.subheader("My competition results")
@@ -1839,6 +2584,87 @@ elif page == "🤺 Current Session":
         col1.metric("Bouts", len(session_bouts))
         col2.metric("Record", f"{wins}–{losses}")
         col3.metric("Indicator", f"{touches_for - touches_against:+d}")
+
+        # ----------------------------------------------------
+        # LIVE OPPONENT-ADJUSTED SESSION PERFORMANCE
+        # ----------------------------------------------------
+
+        if normalize_name(
+            active_session.get(
+                "session_type"
+            )
+        ) != "competition":
+            live_strength_data = (
+                calculate_strength_rankings()
+            )
+
+            live_form_data = (
+                calculate_my_current_form(
+                    live_strength_data
+                )
+            )
+
+            live_weapon = (
+                canonical_weapon(
+                    active_session.get(
+                        "weapon"
+                    )
+                )
+            )
+
+            live_summary = None
+
+            if live_form_data:
+                live_summary = (
+                    live_form_data[
+                        "weapons"
+                    ][live_weapon][
+                        "by_session"
+                    ].get(
+                        active_session["id"]
+                    )
+                )
+
+            if live_summary:
+                st.subheader(
+                    "Opponent-adjusted performance"
+                )
+
+                col_a, col_b, col_c = (
+                    st.columns(3)
+                )
+
+                with col_a:
+                    st.metric(
+                        "Rated bouts",
+                        live_summary[
+                            "rated_bouts"
+                        ],
+                    )
+
+                with col_b:
+                    st.metric(
+                        "Actual vs expected",
+                        (
+                            f"{live_summary['actual_points']:.1f} / "
+                            f"{live_summary['expected_points']:.1f}"
+                        ),
+                        delta=(
+                            f"{live_summary['over_expected']:+.1f}"
+                        ),
+                    )
+
+                with col_c:
+                    st.metric(
+                        "Form impact",
+                        f"{live_summary['form_change']:+.0f}",
+                    )
+
+                st.caption(
+                    f"{live_summary['label']} • "
+                    f"average rated opponent strength "
+                    f"{live_summary['average_opponent_rating']:.0f}"
+                )
 
         st.divider()
         st.header("⚡ Log Bout")
@@ -2194,6 +3020,138 @@ elif page == "👤 Opponents":
                     f"{row['losses']}L • "
                     f"{row['status']}"
                 )
+
+        # ----------------------------------------------------
+        # CURRENT FORM / MATCHUP ESTIMATE
+        # ----------------------------------------------------
+
+        opponent_form_data = (
+            calculate_my_current_form(
+                selected_strength_data
+            )
+            if current_me
+            else None
+        )
+
+        if (
+            current_me
+            and selected_id
+            == current_me["id"]
+            and opponent_form_data
+        ):
+            st.subheader(
+                "Current form estimate"
+            )
+
+            for weapon_name in (
+                "Épée",
+                "Foil",
+                "Sabre",
+            ):
+                form_row = (
+                    opponent_form_data[
+                        "weapons"
+                    ][weapon_name]
+                )
+
+                if not form_row[
+                    "has_evidence"
+                ]:
+                    continue
+
+                col1, col2, col3 = (
+                    st.columns(3)
+                )
+
+                with col1:
+                    st.metric(
+                        f"{weapon_name} form",
+                        f"{form_row['current_form_rating']:.0f}",
+                        delta=(
+                            f"{form_row['form_delta']:+.0f} "
+                            "vs competition"
+                        ),
+                    )
+
+                with col2:
+                    if form_row[
+                        "estimated_rank"
+                    ]:
+                        st.metric(
+                            "Estimated rank",
+                            (
+                                f"#{form_row['estimated_rank']}"
+                                f"/{form_row['ranking_pool_size']}"
+                            ),
+                        )
+
+                with col3:
+                    st.metric(
+                        "Confidence",
+                        f"{form_row['confidence']:.0f}%",
+                    )
+
+        elif (
+            current_me
+            and selected_id
+            != current_me["id"]
+            and opponent_form_data
+        ):
+            matchup_rows = []
+
+            for weapon_name, opponent_rating_row in (
+                selected_strength_rows
+            ):
+                my_form_row = (
+                    opponent_form_data[
+                        "weapons"
+                    ][weapon_name]
+                )
+
+                if not my_form_row[
+                    "has_evidence"
+                ]:
+                    continue
+
+                chance = expected_score(
+                    my_form_row[
+                        "current_form_rating"
+                    ],
+                    opponent_rating_row[
+                        "rating"
+                    ],
+                )
+
+                matchup_rows.append(
+                    (
+                        weapon_name,
+                        chance,
+                        my_form_row,
+                        opponent_rating_row,
+                    )
+                )
+
+            if matchup_rows:
+                st.subheader(
+                    "Your current matchup estimate"
+                )
+
+                for (
+                    weapon_name,
+                    chance,
+                    my_form_row,
+                    opponent_rating_row,
+                ) in matchup_rows:
+                    st.write(
+                        f"**{weapon_name}: {chance:.0%} expected win chance**"
+                    )
+
+                    st.caption(
+                        f"Your current form "
+                        f"{my_form_row['current_form_rating']:.0f} vs "
+                        f"{selected['name']} competition strength "
+                        f"{opponent_rating_row['rating']:.0f}"
+                    )
 
         # ----------------------------------------------------
         # LOAD THIS FENCER'S COMPETITION DATA
@@ -3671,6 +4629,75 @@ elif page == "📈 Strength Rankings":
 
     st.divider()
 
+    me = get_me()
+
+    if me:
+        form_data = (
+            calculate_my_current_form(
+                strength_data
+            )
+        )
+
+        my_form_row = (
+            form_data[
+                "weapons"
+            ][weapon]
+            if form_data
+            else None
+        )
+
+        if (
+            my_form_row
+            and my_form_row[
+                "has_evidence"
+            ]
+        ):
+            st.subheader(
+                "Your current form"
+            )
+
+            col_a, col_b, col_c = (
+                st.columns(3)
+            )
+
+            with col_a:
+                st.metric(
+                    "Competition strength",
+                    f"{my_form_row['competition_rating']:.0f}",
+                )
+
+            with col_b:
+                st.metric(
+                    "Current form",
+                    f"{my_form_row['current_form_rating']:.0f}",
+                    delta=(
+                        f"{my_form_row['form_delta']:+.0f}"
+                    ),
+                )
+
+            with col_c:
+                if my_form_row[
+                    "estimated_rank"
+                ]:
+                    st.metric(
+                        "Form-equivalent rank",
+                        (
+                            f"#{my_form_row['estimated_rank']}"
+                            f"/{my_form_row['ranking_pool_size']}"
+                        ),
+                    )
+                else:
+                    st.metric(
+                        "Form-equivalent rank",
+                        "—",
+                    )
+
+            st.caption(
+                "This overlay uses your recent training results against "
+                "competition-rated opponents. It does not move anybody's "
+                "competition leaderboard rating."
+            )
+
     if not leaderboard:
         st.info(
             f"No imported {weapon} competition bouts yet."
@@ -3928,6 +4955,278 @@ elif page == "📈 Strength Rankings":
 
 
 # ============================================================
+# MY FORM
+# ============================================================
+
+elif page == "📊 My Form":
+    st.header("📊 My Current Form")
+
+    me = get_me()
+
+    if not me:
+        st.info(
+            "Set your own profile using ⭐ Set as me in Opponents first."
+        )
+
+    else:
+        strength_data = (
+            calculate_strength_rankings()
+        )
+
+        form_data = (
+            calculate_my_current_form(
+                strength_data
+            )
+        )
+
+        weapon = st.selectbox(
+            "Weapon",
+            [
+                "Épée",
+                "Foil",
+                "Sabre",
+            ],
+            key="my_form_weapon",
+        )
+
+        row = (
+            form_data[
+                "weapons"
+            ][weapon]
+        )
+
+        if not row[
+            "has_evidence"
+        ]:
+            st.info(
+                f"No {weapon} evidence yet. Import competition results "
+                "or log training bouts against competition-rated opponents."
+            )
+
+        else:
+            col1, col2, col3 = (
+                st.columns(3)
+            )
+
+            with col1:
+                st.metric(
+                    "Competition strength",
+                    f"{row['competition_rating']:.0f}",
+                    delta=(
+                        (
+                            f"rank #{row['competition_rank']}"
+                        )
+                        if row[
+                            "competition_rank"
+                        ]
+                        else "no comp rank"
+                    ),
+                )
+
+            with col2:
+                st.metric(
+                    "Current form",
+                    f"{row['current_form_rating']:.0f}",
+                    delta=(
+                        f"{row['form_delta']:+.0f} "
+                        "vs competition"
+                    ),
+                )
+
+            with col3:
+                st.metric(
+                    "Form-equivalent rank",
+                    (
+                        f"#{row['estimated_rank']}"
+                        f"/{row['ranking_pool_size']}"
+                        if row[
+                            "estimated_rank"
+                        ]
+                        else "—"
+                    ),
+                )
+
+            col4, col5, col6 = (
+                st.columns(3)
+            )
+
+            with col4:
+                st.metric(
+                    "Confidence",
+                    f"{row['confidence']:.0f}%",
+                )
+
+            with col5:
+                st.metric(
+                    f"Rated training bouts",
+                    row[
+                        "rated_training_bouts"
+                    ],
+                )
+
+            with col6:
+                st.metric(
+                    f"Recent {FORM_RECENT_DAYS}d",
+                    (
+                        f"{row['recent_wins']}W–"
+                        f"{row['recent_losses']}L"
+                    ),
+                )
+
+            st.subheader(
+                "Recent opponent-adjusted performance"
+            )
+
+            if row[
+                "recent_rated_bouts"
+            ]:
+                col7, col8, col9 = (
+                    st.columns(3)
+                )
+
+                with col7:
+                    st.metric(
+                        "Expected wins",
+                        f"{row['recent_expected_points']:.1f}",
+                    )
+
+                with col8:
+                    st.metric(
+                        "Actual wins",
+                        f"{row['recent_actual_points']:.1f}",
+                    )
+
+                with col9:
+                    st.metric(
+                        "Vs expectation",
+                        f"{row['recent_over_expected']:+.1f}",
+                    )
+
+            else:
+                st.caption(
+                    "No recent rated training bouts yet."
+                )
+
+            st.divider()
+            st.subheader(
+                "Session-by-session form"
+            )
+
+            if not row["history"]:
+                st.caption(
+                    "No training sessions against competition-rated "
+                    "opponents yet."
+                )
+
+            else:
+                display_rows = []
+
+                for session in reversed(
+                    row["history"]
+                ):
+                    display_rows.append({
+                        "Date": session["date"],
+                        "Type": session["session_type"],
+                        "Location": session["location"],
+                        "Rated bouts": session["rated_bouts"],
+                        "Record": (
+                            f"{session['wins']}W–"
+                            f"{session['losses']}L"
+                        ),
+                        "Avg opponent": round(
+                            session[
+                                "average_opponent_rating"
+                            ]
+                        ),
+                        "Expected wins": round(
+                            session[
+                                "expected_points"
+                            ],
+                            2,
+                        ),
+                        "Actual wins": round(
+                            session[
+                                "actual_points"
+                            ],
+                            2,
+                        ),
+                        "Vs expected": round(
+                            session[
+                                "over_expected"
+                            ],
+                            2,
+                        ),
+                        "Form change": round(
+                            session[
+                                "form_change"
+                            ],
+                            1,
+                        ),
+                        "Form after": round(
+                            session[
+                                "form_after"
+                            ]
+                        ),
+                        "Assessment": (
+                            session[
+                                "label"
+                            ]
+                        ),
+                        "Weight": (
+                            f"{session['recency_weight']:.0%}"
+                        ),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(
+                        display_rows
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with st.expander(
+                "How current form works"
+            ):
+                st.write(
+                    "Your **competition strength** remains the objective "
+                    "competition-only rating used on the leaderboard."
+                )
+
+                st.write(
+                    "Your **current form** starts from that competition "
+                    "rating and then uses your training and lesson bouts "
+                    "against opponents who already have competition ratings."
+                )
+
+                st.write(
+                    "Only **your** current-form estimate moves. "
+                    "A training loss or win never changes the opponent's "
+                    "competition rating."
+                )
+
+                st.write(
+                    f"Training uses **K = {FORM_TRAINING_K_FACTOR:.0f}** "
+                    f"and a **{FORM_TRAINING_HALF_LIFE_DAYS}-day half-life**, "
+                    f"with only a {FORM_TRAINING_FLOOR:.0%} long-term floor. "
+                    "That makes this deliberately much more responsive to "
+                    "recent improvement than the competition leaderboard."
+                )
+
+                st.write(
+                    "A small score-margin modifier is included, capped at "
+                    f"{FORM_MARGIN_BONUS_CAP:.0%}; win/loss remains by far "
+                    "the main signal."
+                )
+
+                st.write(
+                    "Your diary rating, feelings and written notes do **not** "
+                    "directly alter the numerical form rating. They remain "
+                    "separate evidence for tactical analysis."
+                )
+
+
+# ============================================================
 # SESSION HISTORY
 # ============================================================
 
@@ -3999,6 +5298,91 @@ elif page == "📚 Session History":
         col1.metric("Bouts", len(session_bouts))
         col2.metric("Record", f"{wins}–{losses}")
         col3.metric("Indicator", f"{touches_for - touches_against:+d}")
+
+        # ----------------------------------------------------
+        # OPPONENT-ADJUSTED SESSION PERFORMANCE
+        # ----------------------------------------------------
+
+        if normalize_name(
+            selected_session.get(
+                "session_type"
+            )
+        ) != "competition":
+            history_strength_data = (
+                calculate_strength_rankings()
+            )
+
+            history_form_data = (
+                calculate_my_current_form(
+                    history_strength_data
+                )
+            )
+
+            history_weapon = (
+                canonical_weapon(
+                    selected_session.get(
+                        "weapon"
+                    )
+                )
+            )
+
+            adjusted_summary = None
+
+            if history_form_data:
+                adjusted_summary = (
+                    history_form_data[
+                        "weapons"
+                    ][history_weapon][
+                        "by_session"
+                    ].get(
+                        selected_session[
+                            "id"
+                        ]
+                    )
+                )
+
+            if adjusted_summary:
+                st.subheader(
+                    "Opponent-adjusted performance"
+                )
+
+                col_a, col_b, col_c = (
+                    st.columns(3)
+                )
+
+                with col_a:
+                    st.metric(
+                        "Rated bouts",
+                        adjusted_summary[
+                            "rated_bouts"
+                        ],
+                    )
+
+                with col_b:
+                    st.metric(
+                        "Actual / expected",
+                        (
+                            f"{adjusted_summary['actual_points']:.1f} / "
+                            f"{adjusted_summary['expected_points']:.1f}"
+                        ),
+                        delta=(
+                            f"{adjusted_summary['over_expected']:+.1f}"
+                        ),
+                    )
+
+                with col_c:
+                    st.metric(
+                        "Form change",
+                        f"{adjusted_summary['form_change']:+.0f}",
+                    )
+
+                st.caption(
+                    f"**{adjusted_summary['label']}** • "
+                    f"average rated opponent strength "
+                    f"{adjusted_summary['average_opponent_rating']:.0f} • "
+                    f"form {adjusted_summary['form_before']:.0f} → "
+                    f"{adjusted_summary['form_after']:.0f}"
+                )
 
         if selected_session.get("overall_rating"):
             st.write(
