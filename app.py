@@ -237,6 +237,468 @@ def dedupe_competition_bout_rows(rows):
 
 
 # ============================================================
+# STRENGTH RANKING HELPERS
+# ============================================================
+
+STRENGTH_START_RATING = 1500.0
+STRENGTH_K_FACTOR = 32.0
+STRENGTH_DE_MULTIPLIER = 1.20
+STRENGTH_ESTABLISHED_BOUTS = 10
+
+DE_ROUND_ORDER = {
+    "T512": 0,
+    "T256": 1,
+    "T128": 2,
+    "T64": 3,
+    "T32": 4,
+    "T16": 5,
+    "T8": 6,
+    "QF": 6,
+    "SF": 7,
+    "FINAL": 8,
+}
+
+
+def expected_score(rating_a, rating_b):
+    return 1.0 / (
+        1.0
+        + 10.0 ** ((rating_b - rating_a) / 400.0)
+    )
+
+
+def get_all_competition_bouts():
+    rows = (
+        supabase
+        .table("competition_bouts")
+        .select("*")
+        .order("id")
+        .execute()
+        .data
+    )
+
+    return dedupe_competition_bout_rows(rows)
+
+
+def strength_batch_update(
+    batch,
+    ratings,
+    stats,
+    history,
+    competition,
+    stage_label,
+    multiplier,
+):
+    """Apply one rating period.
+
+    Poules are treated as one rating period and each DE round is treated
+    as one rating period. This avoids arbitrary rating differences caused
+    by the row order of results inside a poule or DE round.
+    """
+    if not batch:
+        return
+
+    participants = set()
+
+    for bout in batch:
+        a_id = bout.get("fencer_a_id")
+        b_id = bout.get("fencer_b_id")
+
+        if a_id is None or b_id is None or a_id == b_id:
+            continue
+
+        participants.add(a_id)
+        participants.add(b_id)
+
+    for fencer_id in participants:
+        ratings.setdefault(
+            fencer_id,
+            STRENGTH_START_RATING,
+        )
+
+        stats.setdefault(
+            fencer_id,
+            {
+                "bouts": 0,
+                "wins": 0,
+                "losses": 0,
+                "draws": 0,
+                "last_competition_date": "",
+                "last_competition_name": "",
+            },
+        )
+
+        history.setdefault(
+            fencer_id,
+            [],
+        )
+
+    snapshot = {
+        fencer_id: ratings[fencer_id]
+        for fencer_id in participants
+    }
+
+    deltas = {
+        fencer_id: 0.0
+        for fencer_id in participants
+    }
+
+    competed = set()
+
+    for bout in batch:
+        a_id = bout.get("fencer_a_id")
+        b_id = bout.get("fencer_b_id")
+
+        if (
+            a_id is None
+            or b_id is None
+            or a_id == b_id
+            or a_id not in snapshot
+            or b_id not in snapshot
+        ):
+            continue
+
+        score_a = bout.get("score_a")
+        score_b = bout.get("score_b")
+
+        if score_a is None or score_b is None:
+            continue
+
+        try:
+            score_a = int(score_a)
+            score_b = int(score_b)
+        except (TypeError, ValueError):
+            continue
+
+        if score_a > score_b:
+            actual_a = 1.0
+            actual_b = 0.0
+        elif score_a < score_b:
+            actual_a = 0.0
+            actual_b = 1.0
+        else:
+            actual_a = 0.5
+            actual_b = 0.5
+
+        expected_a = expected_score(
+            snapshot[a_id],
+            snapshot[b_id],
+        )
+
+        expected_b = 1.0 - expected_a
+
+        k = (
+            STRENGTH_K_FACTOR
+            * multiplier
+        )
+
+        deltas[a_id] += (
+            k
+            * (actual_a - expected_a)
+        )
+
+        deltas[b_id] += (
+            k
+            * (actual_b - expected_b)
+        )
+
+        competed.add(a_id)
+        competed.add(b_id)
+
+        stats[a_id]["bouts"] += 1
+        stats[b_id]["bouts"] += 1
+
+        if actual_a == 1.0:
+            stats[a_id]["wins"] += 1
+            stats[b_id]["losses"] += 1
+        elif actual_a == 0.0:
+            stats[a_id]["losses"] += 1
+            stats[b_id]["wins"] += 1
+        else:
+            stats[a_id]["draws"] += 1
+            stats[b_id]["draws"] += 1
+
+        for fencer_id in (a_id, b_id):
+            stats[fencer_id][
+                "last_competition_date"
+            ] = clean_text(
+                competition.get(
+                    "competition_date"
+                )
+            )
+
+            stats[fencer_id][
+                "last_competition_name"
+            ] = clean_text(
+                competition.get("name")
+            )
+
+    for fencer_id in competed:
+        ratings[fencer_id] += (
+            deltas[fencer_id]
+        )
+
+        history[fencer_id].append({
+            "date": clean_text(
+                competition.get(
+                    "competition_date"
+                )
+            ),
+            "competition": clean_text(
+                competition.get("name")
+            ),
+            "stage": stage_label,
+            "rating": ratings[fencer_id],
+            "change": deltas[fencer_id],
+        })
+
+
+def calculate_strength_rankings():
+    """Calculate current competition-only strength rankings by weapon.
+
+    Model:
+    - All rated fencers start at 1500.
+    - Poule results use standard Elo K=32.
+    - DE results are weighted 20% more strongly.
+    - Final placings are not separately scored because the individual
+      bouts that created those placings are already included.
+    - Training/diary bouts are excluded from the strength ranking.
+    """
+    competitions = get_competitions()
+
+    competition_by_id = {
+        row["id"]: row
+        for row in competitions
+    }
+
+    all_bouts = get_all_competition_bouts()
+
+    bouts_by_competition = {}
+
+    for bout in all_bouts:
+        competition_id = bout.get(
+            "competition_id"
+        )
+
+        if competition_id not in competition_by_id:
+            continue
+
+        bouts_by_competition.setdefault(
+            competition_id,
+            [],
+        ).append(bout)
+
+    chronological_competitions = sorted(
+        competitions,
+        key=lambda row: (
+            clean_text(
+                row.get(
+                    "competition_date"
+                )
+            ),
+            row.get("id", 0),
+        ),
+    )
+
+    results = {}
+
+    for weapon in (
+        "Épée",
+        "Foil",
+        "Sabre",
+    ):
+        ratings = {}
+        stats = {}
+        history = {}
+
+        competition_count = 0
+        processed_bouts = 0
+
+        for competition in chronological_competitions:
+            if canonical_weapon(
+                competition.get("weapon")
+            ) != weapon:
+                continue
+
+            competition_bouts = (
+                bouts_by_competition.get(
+                    competition["id"],
+                    [],
+                )
+            )
+
+            if not competition_bouts:
+                continue
+
+            competition_count += 1
+
+            poule_bouts = [
+                bout
+                for bout in competition_bouts
+                if normalize_name(
+                    bout.get("stage")
+                ) == "poule"
+            ]
+
+            if poule_bouts:
+                strength_batch_update(
+                    poule_bouts,
+                    ratings,
+                    stats,
+                    history,
+                    competition,
+                    "Poules",
+                    1.0,
+                )
+
+                processed_bouts += len(
+                    poule_bouts
+                )
+
+            de_bouts = [
+                bout
+                for bout in competition_bouts
+                if normalize_name(
+                    bout.get("stage")
+                ) == "de"
+            ]
+
+            de_groups = {}
+
+            for bout in de_bouts:
+                raw_round = clean_text(
+                    bout.get("round_name")
+                )
+
+                round_key = (
+                    raw_round.upper()
+                    if raw_round
+                    else "DE"
+                )
+
+                de_groups.setdefault(
+                    round_key,
+                    [],
+                ).append(bout)
+
+            for round_key in sorted(
+                de_groups.keys(),
+                key=lambda key: (
+                    DE_ROUND_ORDER.get(
+                        key,
+                        999,
+                    ),
+                    key,
+                ),
+            ):
+                batch = de_groups[
+                    round_key
+                ]
+
+                strength_batch_update(
+                    batch,
+                    ratings,
+                    stats,
+                    history,
+                    competition,
+                    round_key,
+                    STRENGTH_DE_MULTIPLIER,
+                )
+
+                processed_bouts += len(
+                    batch
+                )
+
+        people = opponent_map()
+        leaderboard = []
+
+        for fencer_id, rating in ratings.items():
+            stat = stats[fencer_id]
+            person = people.get(fencer_id)
+
+            if not person:
+                continue
+
+            bout_count = stat["bouts"]
+
+            win_rate = (
+                stat["wins"]
+                / bout_count
+                * 100
+                if bout_count
+                else 0
+            )
+
+            status = (
+                "Established"
+                if bout_count
+                >= STRENGTH_ESTABLISHED_BOUTS
+                else "Provisional"
+            )
+
+            leaderboard.append({
+                "fencer_id": fencer_id,
+                "name": person["name"],
+                "club": clean_text(
+                    person.get("club")
+                ),
+                "region": clean_text(
+                    person.get("region")
+                ),
+                "official_rank": (
+                    person.get(
+                        "official_rank"
+                    )
+                ),
+                "rating": rating,
+                "bouts": bout_count,
+                "wins": stat["wins"],
+                "losses": stat["losses"],
+                "draws": stat["draws"],
+                "win_rate": win_rate,
+                "status": status,
+                "last_competition_date": stat[
+                    "last_competition_date"
+                ],
+                "last_competition_name": stat[
+                    "last_competition_name"
+                ],
+            })
+
+        leaderboard.sort(
+            key=lambda row: (
+                -row["rating"],
+                -row["bouts"],
+                normalize_name(
+                    row["name"]
+                ),
+            )
+        )
+
+        for rank, row in enumerate(
+            leaderboard,
+            start=1,
+        ):
+            row["rank"] = rank
+
+        by_id = {
+            row["fencer_id"]: row
+            for row in leaderboard
+        }
+
+        results[weapon] = {
+            "leaderboard": leaderboard,
+            "by_id": by_id,
+            "history": history,
+            "competition_count": (
+                competition_count
+            ),
+            "bout_count": processed_bouts,
+        }
+
+    return results
+
+
+# ============================================================
 # IMPORT HELPERS
 # ============================================================
 
@@ -627,6 +1089,7 @@ page = st.sidebar.radio(
         "🤺 Current Session",
         "👤 Opponents",
         "🏆 Competitions",
+        "📈 Strength Rankings",
         "📚 Session History",
         "📖 Bout History",
     ],
@@ -751,6 +1214,75 @@ if page == "🏠 Dashboard":
             f"**{name}** — {values['bouts']} bouts • "
             f"{values['wins']}W–{values['losses']}L"
         )
+
+    st.divider()
+    st.subheader("Competition strength")
+
+    me = get_me()
+
+    if not me:
+        st.info(
+            "Set your own fencer profile in Opponents to show "
+            "your competition strength ranking."
+        )
+    else:
+        strength_data = calculate_strength_rankings()
+
+        my_strength_rows = []
+
+        for weapon_name in (
+            "Épée",
+            "Foil",
+            "Sabre",
+        ):
+            rating_row = (
+                strength_data[
+                    weapon_name
+                ]["by_id"].get(
+                    me["id"]
+                )
+            )
+
+            if rating_row:
+                my_strength_rows.append(
+                    (
+                        weapon_name,
+                        rating_row,
+                    )
+                )
+
+        if not my_strength_rows:
+            st.caption(
+                "No imported competition bouts are linked to "
+                "your profile yet, so you do not have a strength rating."
+            )
+        else:
+            for weapon_name, rating_row in my_strength_rows:
+                col_a, col_b, col_c = st.columns(3)
+
+                with col_a:
+                    st.metric(
+                        f"{weapon_name} rank",
+                        f"#{rating_row['rank']}",
+                    )
+
+                with col_b:
+                    st.metric(
+                        "Strength",
+                        f"{rating_row['rating']:.0f}",
+                    )
+
+                with col_c:
+                    st.metric(
+                        "Comp bouts",
+                        rating_row["bouts"],
+                    )
+
+                st.caption(
+                    f"{rating_row['wins']}W–"
+                    f"{rating_row['losses']}L • "
+                    f"{rating_row['status']}"
+                )
 
     st.divider()
     st.subheader("My competition results")
@@ -1254,6 +1786,68 @@ elif page == "👤 Opponents":
         if selected.get("notes"):
             st.write("**Opponent notes**")
             st.write(selected["notes"])
+
+        st.subheader("Competition strength")
+
+        selected_strength_data = (
+            calculate_strength_rankings()
+        )
+
+        selected_strength_rows = []
+
+        for weapon_name in (
+            "Épée",
+            "Foil",
+            "Sabre",
+        ):
+            row = (
+                selected_strength_data[
+                    weapon_name
+                ]["by_id"].get(
+                    selected_id
+                )
+            )
+
+            if row:
+                selected_strength_rows.append(
+                    (
+                        weapon_name,
+                        row,
+                    )
+                )
+
+        if not selected_strength_rows:
+            st.caption(
+                "No imported competition bouts for this fencer yet."
+            )
+        else:
+            for weapon_name, row in selected_strength_rows:
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.metric(
+                        f"{weapon_name} rank",
+                        f"#{row['rank']}",
+                    )
+
+                with col2:
+                    st.metric(
+                        "Strength",
+                        f"{row['rating']:.0f}",
+                    )
+
+                with col3:
+                    st.metric(
+                        "Comp bouts",
+                        row["bouts"],
+                    )
+
+                st.caption(
+                    f"{row['wins']}W–"
+                    f"{row['losses']}L • "
+                    f"{row['win_rate']:.0f}% wins • "
+                    f"{row['status']}"
+                )
 
         # ----------------------------------------------------
         # LOAD THIS FENCER'S COMPETITION DATA
@@ -2578,6 +3172,312 @@ elif page == "🏆 Competitions":
 
                             st.success("Result saved.")
                             st.rerun()
+
+
+# ============================================================
+# STRENGTH RANKINGS
+# ============================================================
+
+elif page == "📈 Strength Rankings":
+    st.header("📈 Strength Rankings")
+
+    st.caption(
+        "Beta competition-strength ranking calculated from "
+        "imported poule and direct-elimination bouts."
+    )
+
+    weapon = st.selectbox(
+        "Weapon",
+        [
+            "Épée",
+            "Foil",
+            "Sabre",
+        ],
+        key="strength_weapon",
+    )
+
+    strength_data = (
+        calculate_strength_rankings()
+    )
+
+    weapon_data = (
+        strength_data[weapon]
+    )
+
+    leaderboard = (
+        weapon_data["leaderboard"]
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "Rated fencers",
+            len(leaderboard),
+        )
+
+    with col2:
+        st.metric(
+            "Competition bouts",
+            weapon_data["bout_count"],
+        )
+
+    with col3:
+        established_count = sum(
+            1
+            for row in leaderboard
+            if row["status"] == "Established"
+        )
+
+        st.metric(
+            "Established",
+            established_count,
+        )
+
+    with st.expander(
+        "How the strength rating works"
+    ):
+        st.write(
+            "Every fencer starts at **1500** for each weapon. "
+            "Only imported competition bouts affect this rating; "
+            "training and diary bouts do not."
+        )
+
+        st.write(
+            "Poule bouts use a standard Elo update with **K = 32**. "
+            "Direct-elimination bouts are weighted **20% more** because "
+            "they are longer knockout bouts."
+        )
+
+        st.write(
+            "All poule bouts at a competition are treated as one rating "
+            "period, and each DE round is treated as its own rating period. "
+            "This prevents the arbitrary row order of a poule sheet from "
+            "changing the final ratings."
+        )
+
+        st.write(
+            "Final placing is displayed elsewhere but is **not scored again** "
+            "in the strength rating, because the individual bouts that caused "
+            "that placing are already included."
+        )
+
+        st.write(
+            f"A rating is marked **Established** after "
+            f"{STRENGTH_ESTABLISHED_BOUTS} competition bouts. "
+            "Before that it is **Provisional**."
+        )
+
+    st.divider()
+
+    if not leaderboard:
+        st.info(
+            f"No imported {weapon} competition bouts yet."
+        )
+
+    else:
+        minimum_bouts = st.selectbox(
+            "Minimum competition bouts",
+            [1, 3, 5, 10],
+            index=0,
+        )
+
+        filtered = [
+            row
+            for row in leaderboard
+            if row["bouts"] >= minimum_bouts
+        ]
+
+        if not filtered:
+            st.info(
+                "No fencers meet that minimum-bout filter."
+            )
+
+        else:
+            display_rows = []
+
+            for row in filtered:
+                official_rank = (
+                    row["official_rank"]
+                    if row.get(
+                        "official_rank"
+                    )
+                    is not None
+                    else ""
+                )
+
+                display_rows.append({
+                    "Rank": row["rank"],
+                    "Fencer": row["name"],
+                    "Rating": round(
+                        row["rating"]
+                    ),
+                    "Bouts": row["bouts"],
+                    "Record": (
+                        f"{row['wins']}W–"
+                        f"{row['losses']}L"
+                    ),
+                    "Win %": round(
+                        row["win_rate"]
+                    ),
+                    "Status": row["status"],
+                    "Club": row["club"],
+                    "Region": row["region"],
+                    "Official rank": official_rank,
+                })
+
+            ranking_df = pd.DataFrame(
+                display_rows
+            )
+
+            st.dataframe(
+                ranking_df,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            st.divider()
+            st.subheader("Fencer rating detail")
+
+            fencer_lookup = {
+                row["name"]: row
+                for row in filtered
+            }
+
+            selected_name = st.selectbox(
+                "Fencer",
+                list(
+                    fencer_lookup.keys()
+                ),
+                key="strength_fencer_detail",
+            )
+
+            selected_rating = (
+                fencer_lookup[
+                    selected_name
+                ]
+            )
+
+            col_a, col_b, col_c = (
+                st.columns(3)
+            )
+
+            with col_a:
+                st.metric(
+                    "App rank",
+                    f"#{selected_rating['rank']}",
+                )
+
+            with col_b:
+                st.metric(
+                    "Strength rating",
+                    f"{selected_rating['rating']:.0f}",
+                )
+
+            with col_c:
+                st.metric(
+                    "Competition bouts",
+                    selected_rating["bouts"],
+                )
+
+            st.write(
+                f"**Competition record:** "
+                f"{selected_rating['wins']}W–"
+                f"{selected_rating['losses']}L"
+                + (
+                    f"–{selected_rating['draws']}D"
+                    if selected_rating[
+                        "draws"
+                    ]
+                    else ""
+                )
+            )
+
+            st.write(
+                f"**Status:** "
+                f"{selected_rating['status']}"
+            )
+
+            if selected_rating.get(
+                "last_competition_name"
+            ):
+                st.caption(
+                    "Latest rated competition: "
+                    f"{selected_rating['last_competition_name']} "
+                    f"({selected_rating['last_competition_date']})"
+                )
+
+            fencer_id = (
+                selected_rating[
+                    "fencer_id"
+                ]
+            )
+
+            rating_history = (
+                weapon_data[
+                    "history"
+                ].get(
+                    fencer_id,
+                    [],
+                )
+            )
+
+            if rating_history:
+                st.subheader(
+                    "Rating history"
+                )
+
+                chart_rows = []
+
+                for step, point in enumerate(
+                    rating_history,
+                    start=1,
+                ):
+                    chart_rows.append({
+                        "Step": step,
+                        "Rating": point[
+                            "rating"
+                        ],
+                    })
+
+                chart_df = pd.DataFrame(
+                    chart_rows
+                ).set_index("Step")
+
+                st.line_chart(
+                    chart_df["Rating"]
+                )
+
+                history_rows = []
+
+                for point in reversed(
+                    rating_history
+                ):
+                    history_rows.append({
+                        "Date": point[
+                            "date"
+                        ],
+                        "Competition": point[
+                            "competition"
+                        ],
+                        "Stage": point[
+                            "stage"
+                        ],
+                        "Rating": round(
+                            point["rating"]
+                        ),
+                        "Change": (
+                            f"{point['change']:+.1f}"
+                        ),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(
+                        history_rows
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
 
 # ============================================================
