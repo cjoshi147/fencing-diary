@@ -252,6 +252,20 @@ STRENGTH_RECENCY_HALF_LIFE_DAYS = 180
 STRENGTH_RECENCY_FLOOR = 0.25
 STRENGTH_RECENT_FORM_DAYS = 180
 
+# Competition-category weighting.
+#
+# Open/default competition results are the 1.00 baseline.
+# Novice-only events deliberately move the main strength rating less,
+# while higher-level events carry somewhat more rating information.
+STRENGTH_CATEGORY_WEIGHTS = {
+    "Novice": 0.55,
+    "Club": 0.80,
+    "Open": 1.00,
+    "State": 1.05,
+    "National": 1.15,
+    "International": 1.25,
+}
+
 DE_ROUND_ORDER = {
     "T512": 0,
     "T256": 1,
@@ -328,6 +342,75 @@ def competition_recency_weight(
     return weight, age_days
 
 
+def competition_category_weight(competition):
+    """Return (label, multiplier) for the strength model.
+
+    The explicit competitions.level field is used first. If it is blank,
+    the event/competition name is inspected so imported novice events are
+    still safely down-weighted. Unknown/open events use the Open baseline.
+    """
+    level_raw = clean_text(
+        competition.get("level")
+    )
+    event_raw = clean_text(
+        competition.get("event_name")
+    )
+    name_raw = clean_text(
+        competition.get("name")
+    )
+
+    combined = normalize_name(
+        " ".join(
+            value
+            for value in (
+                level_raw,
+                event_raw,
+                name_raw,
+            )
+            if value
+        )
+    )
+
+    explicit_map = {
+        "novice": "Novice",
+        "club": "Club",
+        "open": "Open",
+        "state": "State",
+        "national": "National",
+        "international": "International",
+    }
+
+    explicit_level = normalize_name(level_raw)
+
+    if explicit_level in explicit_map:
+        label = explicit_map[explicit_level]
+        return (
+            label,
+            STRENGTH_CATEGORY_WEIGHTS[label],
+        )
+
+    if "novice" in combined:
+        label = "Novice"
+    elif "international" in combined:
+        label = "International"
+    elif (
+        "national" in combined
+        or "afc" in combined
+    ):
+        label = "National"
+    elif "state" in combined:
+        label = "State"
+    elif "club" in combined:
+        label = "Club"
+    else:
+        label = "Open"
+
+    return (
+        label,
+        STRENGTH_CATEGORY_WEIGHTS[label],
+    )
+
+
 def get_all_competition_bouts():
     rows = (
         supabase
@@ -350,14 +433,17 @@ def strength_batch_update(
     stage_label,
     stage_multiplier,
     recency_multiplier=1.0,
+    category_multiplier=1.0,
+    category_label="Open",
     age_days=0,
 ):
     """Apply one rating period.
 
     Poules are treated as one rating period and each DE round is treated
     as one rating period. Rating changes are multiplied by both the stage
-    multiplier and a recency multiplier, so current results matter more
-    than old results without deleting historical evidence.
+    multiplier, a recency multiplier, and a competition-category
+    multiplier. This lets current Open/State/National form drive the
+    main rating while novice-only results still contribute at reduced weight.
     """
     if not batch:
         return
@@ -460,6 +546,7 @@ def strength_batch_update(
             STRENGTH_K_FACTOR
             * stage_multiplier
             * recency_multiplier
+            * category_multiplier
         )
 
         deltas[a_id] += (
@@ -480,11 +567,16 @@ def strength_batch_update(
 
         # Effective bouts are a confidence measure for current strength.
         # One recent bout counts as 1.0; an old bout counts less.
-        stats[a_id]["effective_bouts"] += (
+        effective_weight = (
             recency_multiplier
+            * category_multiplier
+        )
+
+        stats[a_id]["effective_bouts"] += (
+            effective_weight
         )
         stats[b_id]["effective_bouts"] += (
-            recency_multiplier
+            effective_weight
         )
 
         is_recent = (
@@ -553,6 +645,12 @@ def strength_batch_update(
             "rating": ratings[fencer_id],
             "change": deltas[fencer_id],
             "recency_weight": recency_multiplier,
+            "category": category_label,
+            "category_weight": category_multiplier,
+            "combined_weight": (
+                recency_multiplier
+                * category_multiplier
+            ),
             "age_days": age_days,
         })
 
@@ -566,6 +664,9 @@ def calculate_strength_rankings():
     - DE results are weighted 20% more strongly.
     - Results are recency weighted: newer competitions move current
       strength more than older competitions.
+    - Competition category also matters: novice-only events are
+      deliberately down-weighted, while State/National/International
+      events carry somewhat more weight than the Open baseline.
     - Old results retain a 25% minimum influence rather than vanishing.
     - Final placings are not separately scored because the individual
       bouts that created those placings are already included.
@@ -650,6 +751,13 @@ def calculate_strength_rankings():
                 )
             )
 
+            (
+                category_label,
+                category_multiplier,
+            ) = competition_category_weight(
+                competition
+            )
+
             poule_bouts = [
                 bout
                 for bout in competition_bouts
@@ -668,6 +776,8 @@ def calculate_strength_rankings():
                     "Poules",
                     1.0,
                     recency_multiplier,
+                    category_multiplier,
+                    category_label,
                     age_days,
                 )
 
@@ -724,6 +834,8 @@ def calculate_strength_rankings():
                     round_key,
                     STRENGTH_DE_MULTIPLIER,
                     recency_multiplier,
+                    category_multiplier,
+                    category_label,
                     age_days,
                 )
 
@@ -2798,7 +2910,9 @@ elif page == "🏆 Competitions":
                     "Level",
                     [
                         "",
+                        "Novice",
                         "Club",
+                        "Open",
                         "State",
                         "National",
                         "International",
@@ -3371,7 +3485,8 @@ elif page == "📈 Strength Rankings":
 
     st.caption(
         "Current-strength ranking from imported competition results. "
-        "Recent performances count more strongly than older ones."
+        "Recent performances count more strongly than older ones, and "
+        "competition category affects how strongly each result moves the rating."
     )
 
     weapon = st.selectbox(
@@ -3446,10 +3561,31 @@ elif page == "📈 Strength Rankings":
         )
 
         st.write(
+            "**Competition category is weighted too.** "
+            "The current multipliers are: "
+            + " • ".join(
+                f"{label} {weight:.0%}"
+                for label, weight
+                in STRENGTH_CATEGORY_WEIGHTS.items()
+            )
+            + ". The Open value is the baseline. This means a novice-only "
+            "result still teaches the model something, but it cannot move "
+            "the main strength rating as much as an equivalent Open, State, "
+            "National, or International result."
+        )
+
+        st.write(
+            "The effective rating movement is therefore approximately "
+            "**Elo result × DE/poule weight × recency weight × competition "
+            "category weight**."
+        )
+
+        st.write(
             f"The **recent form** record covers the last "
             f"{STRENGTH_RECENT_FORM_DAYS} days. Confidence is based on "
-            "recency-weighted effective bout volume, so a large amount of "
-            "fresh data produces a more trustworthy current rating."
+            "recency- and category-weighted effective bout volume, so a large "
+            "amount of fresh Open/State/National-level data produces a more "
+            "trustworthy current rating than the same amount of old or novice data."
         )
 
         st.write(
@@ -3705,8 +3841,18 @@ elif page == "📈 Strength Rankings":
                         "Change": (
                             f"{point['change']:+.1f}"
                         ),
+                        "Category": point.get(
+                            "category",
+                            "Open",
+                        ),
+                        "Category weight": (
+                            f"{point.get('category_weight', 1.0):.0%}"
+                        ),
                         "Recency weight": (
                             f"{point.get('recency_weight', 1.0):.0%}"
+                        ),
+                        "Combined weight": (
+                            f"{point.get('combined_weight', 1.0):.0%}"
                         ),
                     })
 
