@@ -269,6 +269,7 @@ STRENGTH_RECENT_FORM_DAYS = 180
 # while higher-level events carry somewhat more rating information.
 STRENGTH_CATEGORY_WEIGHTS = {
     "Novice": 0.55,
+    "Age Group": 0.75,
     "Club": 0.80,
     "Open": 1.00,
     "State": 1.05,
@@ -383,6 +384,9 @@ def competition_category_weight(competition):
 
     explicit_map = {
         "novice": "Novice",
+        "age group": "Age Group",
+        "age-group": "Age Group",
+        "youth": "Age Group",
         "club": "Club",
         "open": "Open",
         "state": "State",
@@ -399,7 +403,16 @@ def competition_category_weight(competition):
             STRENGTH_CATEGORY_WEIGHTS[label],
         )
 
-    if "novice" in combined:
+    if (
+        "age group" in combined
+        or "agegroup" in combined
+        or "u15" in combined
+        or "u17" in combined
+        or "u20" in combined
+        or "youth" in combined
+    ):
+        label = "Age Group"
+    elif "novice" in combined:
         label = "Novice"
     elif "international" in combined:
         label = "International"
@@ -2945,6 +2958,7 @@ elif page == "🏆 Competitions":
                     [
                         "",
                         "Novice",
+                        "Age Group",
                         "Club",
                         "Open",
                         "State",
@@ -3608,8 +3622,8 @@ elif page == "📈 Strength Rankings":
                 for label, weight
                 in STRENGTH_CATEGORY_WEIGHTS.items()
             )
-            + ". The Open value is the baseline. This means a novice-only "
-            "result still teaches the model something, but it cannot move "
+            + ". The Open value is the baseline. Novice and Age Group "
+            "results still teach the model something, but they cannot move "
             "the main strength rating as much as an equivalent Open, State, "
             "National, or International result."
         )
@@ -3621,11 +3635,19 @@ elif page == "📈 Strength Rankings":
         )
 
         st.write(
+            "**Age Group events currently use a 75% multiplier.** "
+            "That is deliberately above Novice but below Open: strong youth "
+            "results matter, while the model avoids assuming that an age-limited "
+            "field is identical in strength to an unrestricted Open field."
+        )
+
+        st.write(
             f"The **recent form** record covers the last "
             f"{STRENGTH_RECENT_FORM_DAYS} days. Confidence is based on "
             "recency- and category-weighted effective bout volume, so a large "
             "amount of fresh Open/State/National-level data produces a more "
-            "trustworthy current rating than the same amount of old or novice data."
+            "trustworthy current rating than the same amount of old, novice, or "
+            "Age Group-only data."
         )
 
         st.write(
