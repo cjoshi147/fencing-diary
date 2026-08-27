@@ -86,6 +86,18 @@ def get_opponents():
     )
 
 
+def get_me():
+    response = (
+        supabase
+        .table("opponents")
+        .select("*")
+        .eq("is_me", True)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
 def opponent_map():
     return {row["id"]: row for row in get_opponents()}
 
@@ -703,6 +715,99 @@ if page == "🏠 Dashboard":
         )
 
     st.divider()
+    st.subheader("My competition results")
+
+    me = get_me()
+
+    if not me:
+        st.info(
+            "Set your own fencer profile in Opponents to show "
+            "your competition results here."
+        )
+    else:
+        my_comp_entries = (
+            supabase
+            .table("competition_fencers")
+            .select("*")
+            .eq("opponent_id", me["id"])
+            .execute()
+            .data
+        )
+
+        competitions_by_id = {
+            row["id"]: row
+            for row in get_competitions()
+        }
+
+        my_comp_rows = []
+
+        for entry in my_comp_entries:
+            competition = competitions_by_id.get(
+                entry.get("competition_id")
+            )
+
+            if competition:
+                my_comp_rows.append(
+                    (competition, entry)
+                )
+
+        my_comp_rows.sort(
+            key=lambda item:
+                clean_text(item[0].get("competition_date")),
+            reverse=True,
+        )
+
+        if not my_comp_rows:
+            st.caption(
+                "No imported competition results are linked "
+                "to your profile yet."
+            )
+        else:
+            for competition, entry in my_comp_rows[:5]:
+                place_label = (
+                    clean_text(entry.get("final_place_label"))
+                    or (
+                        str(entry["final_place"])
+                        if entry.get("final_place") is not None
+                        else "—"
+                    )
+                )
+
+                result_line = f"**{competition['name']}**"
+
+                if competition.get("event_name"):
+                    result_line += (
+                        f" — {competition['event_name']}"
+                    )
+
+                st.write(result_line)
+
+                detail_bits = [
+                    clean_text(competition.get("competition_date")),
+                    (
+                        f"Final: {place_label}"
+                        + (
+                            f" / {competition['field_size']}"
+                            if competition.get("field_size")
+                            else ""
+                        )
+                    ),
+                ]
+
+                if entry.get("de_seed"):
+                    detail_bits.append(
+                        f"DE seed: {entry['de_seed']}"
+                    )
+
+                st.caption(
+                    " • ".join(
+                        bit
+                        for bit in detail_bits
+                        if bit
+                    )
+                )
+
+    st.divider()
     st.subheader("Latest bouts")
 
     for bout in bouts[:5]:
@@ -1052,6 +1157,41 @@ elif page == "👤 Opponents":
 
         st.divider()
         st.header(selected["name"])
+
+        current_me = get_me()
+
+        if selected.get("is_me"):
+            st.success("⭐ This is your fencer profile.")
+        else:
+            if current_me:
+                st.caption(
+                    f"Current 'me' profile: {current_me['name']}"
+                )
+
+            if st.button(
+                "⭐ Set as me",
+                type="primary",
+                use_container_width=True,
+            ):
+                # Ensure only one opponent row is marked as the user.
+                supabase.table("opponents").update({
+                    "is_me": False
+                }).eq(
+                    "is_me",
+                    True
+                ).execute()
+
+                supabase.table("opponents").update({
+                    "is_me": True
+                }).eq(
+                    "id",
+                    selected["id"]
+                ).execute()
+
+                st.success(
+                    f"{selected['name']} is now your fencer profile."
+                )
+                st.rerun()
 
         details = [
             clean_text(selected.get("club")),
@@ -1664,7 +1804,12 @@ elif page == "🏆 Competitions":
                 if not person:
                     continue
 
-                pieces = [f"**{person['name']}**"]
+                display_name = person["name"]
+
+                if person.get("is_me"):
+                    display_name += " ⭐ You"
+
+                pieces = [f"**{display_name}**"]
 
                 if row.get("initial_seed"):
                     pieces.append(f"Initial seed {row['initial_seed']}")
@@ -1818,8 +1963,13 @@ elif page == "🏆 Competitions":
                         or str(row["final_place"])
                     )
 
+                    display_name = person["name"]
+
+                    if person.get("is_me"):
+                        display_name += " ⭐ You"
+
                     st.write(
-                        f"**{place_label}.** {person['name']}"
+                        f"**{place_label}.** {display_name}"
                     )
 
             # ------------------------------------------------
