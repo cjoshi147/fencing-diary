@@ -1117,30 +1117,12 @@ def parse_import(df):
 def find_existing_competition(comp):
     """Find one exact fencing event.
 
-    Tournament name/date/weapon are not enough because men's and women's
-    events can share all three. v0.5.4 therefore uses event_name as part
-    of a stable event key.
+    An event is identified by:
+    tournament name + date + weapon + event_name.
+
+    This deliberately does NOT depend on an event_key database column, so
+    the importer still works even if that optional migration was not applied.
     """
-    event_key = competition_event_key(
-        comp["name"],
-        comp["competition_date"],
-        comp["weapon"],
-        comp["event_name"],
-    )
-
-    query = (
-        supabase
-        .table("competitions")
-        .select("*")
-        .eq("event_key", event_key)
-        .limit(1)
-        .execute()
-    )
-
-    if query.data:
-        return query.data[0]
-
-    # Fallback for legacy rows that predate event_key.
     query = (
         supabase
         .table("competitions")
@@ -1148,25 +1130,26 @@ def find_existing_competition(comp):
         .eq("name", comp["name"])
         .eq("competition_date", comp["competition_date"])
         .eq("weapon", comp["weapon"])
-        .eq("event_name", comp["event_name"])
+    )
+
+    if comp.get("event_name"):
+        query = query.eq(
+            "event_name",
+            comp["event_name"],
+        )
+    else:
+        query = query.is_(
+            "event_name",
+            "null",
+        )
+
+    result = (
+        query
         .limit(1)
         .execute()
     )
 
-    if query.data:
-        existing = query.data[0]
-
-        supabase.table("competitions").update({
-            "event_key": event_key
-        }).eq(
-            "id",
-            existing["id"]
-        ).execute()
-
-        existing["event_key"] = event_key
-        return existing
-
-    return None
+    return result.data[0] if result.data else None
 
 
 def find_exact_opponent(imported_fencer, existing_opponents):
@@ -1195,12 +1178,6 @@ def import_competition_data(comp, imported_fencers, imported_bouts, name_choices
         "name": comp["name"],
         "competition_date": comp["competition_date"],
         "event_name": comp["event_name"] or None,
-        "event_key": competition_event_key(
-            comp["name"],
-            comp["competition_date"],
-            comp["weapon"],
-            comp["event_name"],
-        ),
         "weapon": comp["weapon"],
         "location": comp["location"] or None,
         "level": comp["level"] or None,
@@ -2781,7 +2758,7 @@ elif page == "🏆 Competitions":
                     st.write(
                         f"**Date:** {comp['competition_date']}  \n"
                         f"**Weapon:** {comp['weapon']}  \n"
-                        f"**Event identity:** `{competition_event_key(comp['name'], comp['competition_date'], comp['weapon'], comp['event_name'])}`  \n"
+                        f"**Event identity preview:** `{competition_event_key(comp['name'], comp['competition_date'], comp['weapon'], comp['event_name'])}`  \n"
                         f"**Location:** {comp['location'] or '—'}  \n"
                         f"**Field size:** {comp['field_size'] or len(imported_fencers)}"
                     )
@@ -2992,16 +2969,14 @@ elif page == "🏆 Competitions":
             if create:
                 if not competition_name.strip():
                     st.error("Enter a competition name.")
+                elif not event_name.strip():
+                    st.error(
+                        "Enter an event name so separate events cannot be merged."
+                    )
                 else:
                     supabase.table("competitions").insert({
                         "name": competition_name.strip(),
                         "event_name": event_name.strip() or None,
-                        "event_key": competition_event_key(
-                            competition_name.strip(),
-                            str(competition_date),
-                            weapon,
-                            event_name.strip(),
-                        ),
                         "competition_date": str(competition_date),
                         "weapon": weapon,
                         "location": location.strip() or None,
