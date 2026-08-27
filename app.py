@@ -164,10 +164,14 @@ def get_competition_bouts(competition_id):
         .execute()
         .data
     )
+
+    rows = dedupe_competition_bout_rows(rows)
+
     people = opponent_map()
     for row in rows:
         row["fencer_a"] = people.get(row.get("fencer_a_id"))
         row["fencer_b"] = people.get(row.get("fencer_b_id"))
+
     return rows
 
 
@@ -196,6 +200,40 @@ def canonical_bout_signature(stage, poule_number, round_name, a_id, score_a, b_i
         int(a_id),
         int(score_a),
     )
+
+
+def dedupe_competition_bout_rows(rows):
+    """Return one row for each actual competition bout.
+
+    This protects the UI from legacy duplicate rows already stored in
+    Supabase, including the same bout entered with the fencers reversed.
+    """
+    unique_rows = []
+    seen = set()
+
+    for row in rows:
+        try:
+            signature = canonical_bout_signature(
+                row.get("stage"),
+                row.get("poule_number"),
+                row.get("round_name"),
+                row.get("fencer_a_id"),
+                row.get("score_a"),
+                row.get("fencer_b_id"),
+                row.get("score_b"),
+            )
+        except (TypeError, ValueError):
+            # Keep malformed legacy rows visible rather than crashing.
+            unique_rows.append(row)
+            continue
+
+        if signature in seen:
+            continue
+
+        seen.add(signature)
+        unique_rows.append(row)
+
+    return unique_rows
 
 
 # ============================================================
@@ -1248,6 +1286,10 @@ elif page == "👤 Opponents":
             .order("id")
             .execute()
             .data
+        )
+
+        competition_bouts = dedupe_competition_bout_rows(
+            competition_bouts
         )
 
         people_by_id = opponent_map()
