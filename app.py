@@ -2,16 +2,31 @@ import streamlit as st
 from supabase import create_client
 from datetime import date, datetime, timezone
 
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
 st.set_page_config(
     page_title="Fencing Diary",
     page_icon="🤺",
     layout="centered"
 )
 
+
+# ============================================================
+# SUPABASE CONNECTION
+# ============================================================
+
 supabase = create_client(
     st.secrets["SUPABASE_URL"],
     st.secrets["SUPABASE_KEY"]
 )
+
+
+# ============================================================
+# TITLE
+# ============================================================
 
 st.title("🤺 Fencing Diary")
 
@@ -21,12 +36,16 @@ st.title("🤺 Fencing Diary")
 # ============================================================
 
 def get_active_session():
+
     response = (
         supabase
         .table("sessions")
         .select("*")
         .is_("ended_at", "null")
-        .order("created_at", desc=True)
+        .order(
+            "created_at",
+            desc=True
+        )
         .limit(1)
         .execute()
     )
@@ -38,6 +57,7 @@ def get_active_session():
 
 
 def get_opponents():
+
     return (
         supabase
         .table("opponents")
@@ -49,17 +69,41 @@ def get_opponents():
 
 
 def get_bouts():
+
     return (
         supabase
         .table("bouts")
-        .select("*, opponents(name)")
-        .order("created_at", desc=True)
+        .select(
+            "*, opponents(name)"
+        )
+        .order(
+            "created_at",
+            desc=True
+        )
         .execute()
         .data
     )
 
 
-def get_result(my_score, their_score):
+def get_sessions():
+
+    return (
+        supabase
+        .table("sessions")
+        .select("*")
+        .order(
+            "session_date",
+            desc=True
+        )
+        .execute()
+        .data
+    )
+
+
+def get_result(
+    my_score,
+    their_score
+):
 
     if my_score > their_score:
         return "W"
@@ -70,13 +114,28 @@ def get_result(my_score, their_score):
     return "D"
 
 
+def get_result_icon(
+    my_score,
+    their_score
+):
+
+    if my_score > their_score:
+        return "🟢 W"
+
+    elif my_score < their_score:
+        return "🔴 L"
+
+    return "⚪ D"
+
+
 # ============================================================
-# NAVIGATION
+# SIDEBAR
 # ============================================================
 
 page = st.sidebar.radio(
     "Menu",
     [
+        "🏠 Dashboard",
         "🤺 Current Session",
         "👤 Opponents",
         "📚 Session History",
@@ -86,35 +145,480 @@ page = st.sidebar.radio(
 
 
 # ============================================================
+# DASHBOARD
+# ============================================================
+
+if page == "🏠 Dashboard":
+
+    st.header("Your Fencing")
+
+    bouts = get_bouts()
+    sessions = get_sessions()
+
+    # --------------------------------------------------------
+    # OVERALL STATS
+    # --------------------------------------------------------
+
+    total_bouts = len(bouts)
+
+    wins = 0
+    losses = 0
+    draws = 0
+
+    touches_for = 0
+    touches_against = 0
+
+    feeling_total = 0
+    feeling_count = 0
+
+    for bout in bouts:
+
+        my_score = bout["my_score"]
+        their_score = bout[
+            "opponent_score"
+        ]
+
+        touches_for += my_score
+
+        touches_against += (
+            their_score
+        )
+
+        if my_score > their_score:
+
+            wins += 1
+
+        elif my_score < their_score:
+
+            losses += 1
+
+        else:
+
+            draws += 1
+
+        if (
+            bout.get("feeling")
+            is not None
+        ):
+
+            feeling_total += (
+                bout["feeling"]
+            )
+
+            feeling_count += 1
+
+    if total_bouts > 0:
+
+        win_rate = (
+            wins
+            / total_bouts
+            * 100
+        )
+
+        average_margin = (
+            touches_for
+            - touches_against
+        ) / total_bouts
+
+    else:
+
+        win_rate = 0
+        average_margin = 0
+
+    if feeling_count > 0:
+
+        average_feeling = (
+            feeling_total
+            / feeling_count
+        )
+
+    else:
+
+        average_feeling = 0
+
+    completed_sessions = [
+        session
+        for session in sessions
+        if session.get("ended_at")
+    ]
+
+    # --------------------------------------------------------
+    # TOP METRICS
+    # --------------------------------------------------------
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.metric(
+            "Total bouts",
+            total_bouts
+        )
+
+    with col2:
+
+        st.metric(
+            "Win rate",
+            f"{win_rate:.0f}%"
+        )
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+
+        st.metric(
+            "Record",
+            f"{wins}W – {losses}L"
+        )
+
+    with col4:
+
+        st.metric(
+            "Avg margin",
+            f"{average_margin:+.2f}"
+        )
+
+    col5, col6 = st.columns(2)
+
+    with col5:
+
+        st.metric(
+            "Sessions",
+            len(
+                completed_sessions
+            )
+        )
+
+    with col6:
+
+        st.metric(
+            "Avg fencing",
+            f"{average_feeling:.1f}/10"
+        )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # RECENT FORM
+    # --------------------------------------------------------
+
+    st.subheader("Recent form")
+
+    recent_bouts = bouts[:10]
+
+    if not recent_bouts:
+
+        st.info(
+            "Log some bouts to "
+            "see your recent form."
+        )
+
+    else:
+
+        result_string = ""
+
+        recent_wins = 0
+        recent_losses = 0
+        recent_draws = 0
+
+        # Reverse so oldest -> newest
+        for bout in reversed(
+            recent_bouts
+        ):
+
+            my_score = (
+                bout["my_score"]
+            )
+
+            their_score = (
+                bout[
+                    "opponent_score"
+                ]
+            )
+
+            if my_score > their_score:
+
+                result_string += "🟢 "
+
+                recent_wins += 1
+
+            elif my_score < their_score:
+
+                result_string += "🔴 "
+
+                recent_losses += 1
+
+            else:
+
+                result_string += "⚪ "
+
+                recent_draws += 1
+
+        st.write(
+            result_string
+        )
+
+        st.caption(
+            f"Last "
+            f"{len(recent_bouts)} bouts: "
+            f"{recent_wins}W – "
+            f"{recent_losses}L"
+        )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # MOST FENCED OPPONENTS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Most fenced opponents"
+    )
+
+    opponent_stats = {}
+
+    for bout in bouts:
+
+        opponent_data = (
+            bout.get("opponents")
+        )
+
+        if not opponent_data:
+            continue
+
+        name = (
+            opponent_data["name"]
+        )
+
+        if name not in opponent_stats:
+
+            opponent_stats[name] = {
+                "bouts": 0,
+                "wins": 0,
+                "losses": 0,
+                "draws": 0
+            }
+
+        opponent_stats[
+            name
+        ]["bouts"] += 1
+
+        if (
+            bout["my_score"]
+            >
+            bout["opponent_score"]
+        ):
+
+            opponent_stats[
+                name
+            ]["wins"] += 1
+
+        elif (
+            bout["my_score"]
+            <
+            bout["opponent_score"]
+        ):
+
+            opponent_stats[
+                name
+            ]["losses"] += 1
+
+        else:
+
+            opponent_stats[
+                name
+            ]["draws"] += 1
+
+    sorted_opponents = sorted(
+        opponent_stats.items(),
+        key=lambda item:
+            item[1]["bouts"],
+        reverse=True
+    )
+
+    if not sorted_opponents:
+
+        st.info(
+            "No opponent data yet."
+        )
+
+    else:
+
+        for (
+            name,
+            stats
+        ) in sorted_opponents[:5]:
+
+            st.write(
+                f"**{name}** — "
+                f"{stats['bouts']} bouts • "
+                f"{stats['wins']}W–"
+                f"{stats['losses']}L"
+            )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # LATEST BOUTS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Latest bouts"
+    )
+
+    if not bouts:
+
+        st.info(
+            "No bouts yet."
+        )
+
+    else:
+
+        for bout in bouts[:5]:
+
+            opponent_data = (
+                bout.get(
+                    "opponents"
+                )
+            )
+
+            if opponent_data:
+
+                opponent = (
+                    opponent_data[
+                        "name"
+                    ]
+                )
+
+            else:
+
+                opponent = (
+                    "Unknown opponent"
+                )
+
+            my_score = (
+                bout["my_score"]
+            )
+
+            their_score = (
+                bout[
+                    "opponent_score"
+                ]
+            )
+
+            result = (
+                get_result_icon(
+                    my_score,
+                    their_score
+                )
+            )
+
+            st.write(
+                f"**{result} "
+                f"{my_score}–"
+                f"{their_score}** "
+                f"vs {opponent}"
+            )
+
+            if bout.get("notes"):
+
+                st.caption(
+                    bout["notes"]
+                )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # RECENT SESSIONS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Recent sessions"
+    )
+
+    if not completed_sessions:
+
+        st.info(
+            "No completed sessions yet."
+        )
+
+    else:
+
+        for session in (
+            completed_sessions[:5]
+        ):
+
+            text = (
+                f"**"
+                f"{session['session_date']}"
+                f"** — "
+                f"{session['session_type']}"
+                f" • "
+                f"{session['weapon']}"
+            )
+
+            if session.get(
+                "location"
+            ):
+
+                text += (
+                    f" • "
+                    f"{session['location']}"
+                )
+
+            st.write(text)
+
+            if session.get(
+                "overall_rating"
+            ):
+
+                st.caption(
+                    f"Session rating: "
+                    f"{session['overall_rating']}"
+                    f"/10"
+                )
+
+
+# ============================================================
 # CURRENT SESSION
 # ============================================================
 
-if page == "🤺 Current Session":
+elif page == "🤺 Current Session":
 
-    active_session = get_active_session()
+    active_session = (
+        get_active_session()
+    )
 
     # --------------------------------------------------------
-    # START SESSION
+    # NO ACTIVE SESSION
     # --------------------------------------------------------
 
     if active_session is None:
 
-        st.header("Start fencing")
+        st.header(
+            "Start fencing"
+        )
 
-        with st.form("start_session"):
+        with st.form(
+            "start_session"
+        ):
 
-            session_date = st.date_input(
-                "Date",
-                value=date.today()
+            session_date = (
+                st.date_input(
+                    "Date",
+                    value=date.today()
+                )
             )
 
-            session_type = st.selectbox(
-                "Session type",
-                [
-                    "Training",
-                    "Lesson",
-                    "Competition"
-                ]
+            session_type = (
+                st.selectbox(
+                    "Session type",
+                    [
+                        "Training",
+                        "Lesson",
+                        "Competition"
+                    ]
+                )
             )
 
             weapon = st.selectbox(
@@ -126,39 +630,51 @@ if page == "🤺 Current Session":
                 ]
             )
 
-            location = st.text_input(
-                "Location"
+            location = (
+                st.text_input(
+                    "Location"
+                )
             )
 
-            col1, col2 = st.columns(2)
+            col1, col2 = (
+                st.columns(2)
+            )
 
             with col1:
 
-                energy_before = st.slider(
-                    "Energy",
-                    1,
-                    10,
-                    5
+                energy_before = (
+                    st.slider(
+                        "Energy",
+                        1,
+                        10,
+                        5
+                    )
                 )
 
             with col2:
 
-                confidence_before = st.slider(
-                    "Confidence",
-                    1,
-                    10,
-                    5
+                confidence_before = (
+                    st.slider(
+                        "Confidence",
+                        1,
+                        10,
+                        5
+                    )
                 )
 
-            start = st.form_submit_button(
-                "🤺 START SESSION",
-                type="primary",
-                use_container_width=True
+            start_session = (
+                st.form_submit_button(
+                    "🤺 START SESSION",
+                    type="primary",
+                    use_container_width=True
+                )
             )
 
-        if start:
+        if start_session:
 
-            supabase.table("sessions").insert({
+            supabase.table(
+                "sessions"
+            ).insert({
 
                 "session_date":
                     str(session_date),
@@ -189,56 +705,107 @@ if page == "🤺 Current Session":
     else:
 
         st.caption(
-            f"{active_session['session_type']} • "
-            f"{active_session['weapon']} • "
+            f"{active_session['session_type']}"
+            f" • "
+            f"{active_session['weapon']}"
+            f" • "
             f"{active_session['session_date']}"
         )
 
-        if active_session.get("location"):
+        if active_session.get(
+            "location"
+        ):
 
             st.caption(
-                f"📍 {active_session['location']}"
+                f"📍 "
+                f"{active_session['location']}"
             )
 
-        bouts_response = (
+        # ----------------------------------------------------
+        # GET SESSION BOUTS
+        # ----------------------------------------------------
+
+        session_bouts = (
             supabase
             .table("bouts")
-            .select("*, opponents(name)")
+            .select(
+                "*, opponents(name)"
+            )
             .eq(
                 "session_id",
                 active_session["id"]
             )
             .order("created_at")
             .execute()
+            .data
         )
-
-        session_bouts = bouts_response.data
 
         wins = 0
         losses = 0
+        draws = 0
+
         touches_for = 0
         touches_against = 0
 
         for bout in session_bouts:
 
-            touches_for += bout["my_score"]
-            touches_against += bout["opponent_score"]
+            my_score = (
+                bout["my_score"]
+            )
 
-            if bout["my_score"] > bout["opponent_score"]:
+            their_score = (
+                bout[
+                    "opponent_score"
+                ]
+            )
+
+            touches_for += (
+                my_score
+            )
+
+            touches_against += (
+                their_score
+            )
+
+            if (
+                my_score
+                >
+                their_score
+            ):
+
                 wins += 1
 
-            elif bout["my_score"] < bout["opponent_score"]:
+            elif (
+                my_score
+                <
+                their_score
+            ):
+
                 losses += 1
 
-        st.subheader("Current session")
+            else:
 
-        col1, col2, col3 = st.columns(3)
+                draws += 1
+
+        # ----------------------------------------------------
+        # SESSION SCOREBOARD
+        # ----------------------------------------------------
+
+        st.subheader(
+            "Current session"
+        )
+
+        col1, col2, col3 = (
+            st.columns(3)
+        )
 
         with col1:
 
             st.metric(
                 "Bouts",
-                len(session_bouts)
+                len(
+                    session_bouts
+                )
             )
 
         with col2:
@@ -263,12 +830,16 @@ if page == "🤺 Current Session":
         st.divider()
 
         # ----------------------------------------------------
-        # QUICK LOGGER
+        # QUICK BOUT LOGGER
         # ----------------------------------------------------
 
-        st.header("⚡ Log Bout")
+        st.header(
+            "⚡ Log Bout"
+        )
 
-        opponents = get_opponents()
+        opponents = (
+            get_opponents()
+        )
 
         if not opponents:
 
@@ -282,7 +853,8 @@ if page == "🤺 Current Session":
                 person["name"]:
                     person["id"]
 
-                for person in opponents
+                for person
+                in opponents
             }
 
             with st.form(
@@ -290,32 +862,41 @@ if page == "🤺 Current Session":
                 clear_on_submit=True
             ):
 
-                opponent_name = st.selectbox(
-                    "Opponent",
-                    list(
-                        opponent_lookup.keys()
+                opponent_name = (
+                    st.selectbox(
+                        "Opponent",
+                        list(
+                            opponent_lookup.keys()
+                        )
                     )
                 )
 
-                left, middle, right = st.columns(
-                    [4, 1, 4]
+                left, middle, right = (
+                    st.columns(
+                        [4, 1, 4]
+                    )
                 )
 
                 with left:
 
-                    my_score = st.number_input(
-                        "You",
-                        min_value=0,
-                        max_value=50,
-                        value=5,
-                        step=1
+                    my_score = (
+                        st.number_input(
+                            "You",
+                            min_value=0,
+                            max_value=50,
+                            value=5,
+                            step=1
+                        )
                     )
 
                 with middle:
 
                     st.markdown(
-                        "<h2 style='text-align:center;"
-                        "padding-top:22px;'>–</h2>",
+                        "<h2 "
+                        "style='text-align:center;"
+                        "padding-top:22px;'>"
+                        "–"
+                        "</h2>",
                         unsafe_allow_html=True
                     )
 
@@ -331,20 +912,24 @@ if page == "🤺 Current Session":
                         )
                     )
 
-                feeling = st.slider(
-                    "How well did you fence?",
-                    1,
-                    10,
-                    5
+                feeling = (
+                    st.slider(
+                        "How well did you fence?",
+                        1,
+                        10,
+                        5
+                    )
                 )
 
-                quick_note = st.text_area(
-                    "Quick note",
-                    placeholder=(
-                        "Distance good, "
-                        "disengage worked..."
-                    ),
-                    height=80
+                quick_note = (
+                    st.text_area(
+                        "Quick note",
+                        placeholder=(
+                            "e.g. Distance good. "
+                            "Disengage worked."
+                        ),
+                        height=80
+                    )
                 )
 
                 with st.expander(
@@ -378,7 +963,9 @@ if page == "🤺 Current Session":
                 ).insert({
 
                     "session_id":
-                        active_session["id"],
+                        active_session[
+                            "id"
+                        ],
 
                     "opponent_id":
                         opponent_lookup[
@@ -386,13 +973,19 @@ if page == "🤺 Current Session":
                         ],
 
                     "my_score":
-                        int(my_score),
+                        int(
+                            my_score
+                        ),
 
                     "opponent_score":
-                        int(opponent_score),
+                        int(
+                            opponent_score
+                        ),
 
                     "feeling":
-                        int(feeling),
+                        int(
+                            feeling
+                        ),
 
                     "what_worked":
                         what_worked,
@@ -406,54 +999,85 @@ if page == "🤺 Current Session":
                 }).execute()
 
                 st.toast(
-                    f"Saved {my_score}–"
+                    f"Saved "
+                    f"{my_score}–"
                     f"{opponent_score} "
-                    f"vs {opponent_name}",
+                    f"vs "
+                    f"{opponent_name}",
                     icon="🤺"
                 )
 
                 st.rerun()
 
         # ----------------------------------------------------
-        # CURRENT BOUTS
+        # SESSION BOUT LIST
         # ----------------------------------------------------
 
         if session_bouts:
 
             st.divider()
 
-            st.subheader("This session")
+            st.subheader(
+                "This session"
+            )
 
             for bout in reversed(
                 session_bouts
             ):
 
-                opponent = (
-                    bout["opponents"]["name"]
+                opponent_data = (
+                    bout.get(
+                        "opponents"
+                    )
                 )
 
-                my_score = bout["my_score"]
+                if opponent_data:
+
+                    opponent = (
+                        opponent_data[
+                            "name"
+                        ]
+                    )
+
+                else:
+
+                    opponent = (
+                        "Unknown"
+                    )
+
+                my_score = (
+                    bout["my_score"]
+                )
 
                 their_score = (
-                    bout["opponent_score"]
+                    bout[
+                        "opponent_score"
+                    ]
                 )
 
-                result = get_result(
-                    my_score,
-                    their_score
+                result = (
+                    get_result_icon(
+                        my_score,
+                        their_score
+                    )
                 )
 
                 st.write(
                     f"**{result} "
                     f"{my_score}–"
                     f"{their_score}** "
-                    f"vs {opponent}"
+                    f"vs "
+                    f"{opponent}"
                 )
 
-                if bout.get("notes"):
+                if bout.get(
+                    "notes"
+                ):
 
                     st.caption(
-                        bout["notes"]
+                        bout[
+                            "notes"
+                        ]
                     )
 
         # ----------------------------------------------------
@@ -546,7 +1170,13 @@ if page == "🤺 Current Session":
 
 elif page == "👤 Opponents":
 
-    st.header("Opponents")
+    st.header(
+        "Opponents"
+    )
+
+    # --------------------------------------------------------
+    # ADD OPPONENT
+    # --------------------------------------------------------
 
     with st.expander(
         "➕ Add opponent"
@@ -557,34 +1187,44 @@ elif page == "👤 Opponents":
             clear_on_submit=True
         ):
 
-            name = st.text_input(
-                "Name"
+            name = (
+                st.text_input(
+                    "Name"
+                )
             )
 
-            club = st.text_input(
-                "Club"
+            club = (
+                st.text_input(
+                    "Club"
+                )
             )
 
-            handedness = st.selectbox(
-                "Handedness",
-                [
-                    "Unknown",
-                    "Right",
-                    "Left"
-                ]
+            handedness = (
+                st.selectbox(
+                    "Handedness",
+                    [
+                        "Unknown",
+                        "Right",
+                        "Left"
+                    ]
+                )
             )
 
-            weapon = st.selectbox(
-                "Weapon",
-                [
-                    "Épée",
-                    "Foil",
-                    "Sabre"
-                ]
+            weapon = (
+                st.selectbox(
+                    "Weapon",
+                    [
+                        "Épée",
+                        "Foil",
+                        "Sabre"
+                    ]
+                )
             )
 
-            notes = st.text_area(
-                "Opponent notes"
+            notes = (
+                st.text_area(
+                    "Opponent notes"
+                )
             )
 
             add_opponent = (
@@ -629,7 +1269,8 @@ elif page == "👤 Opponents":
                     }).execute()
 
                     st.success(
-                        f"{name.strip()} added!"
+                        f"{name.strip()} "
+                        f"added!"
                     )
 
                     st.rerun()
@@ -638,74 +1279,114 @@ elif page == "👤 Opponents":
 
                     st.error(
                         f"Couldn't add "
-                        f"opponent: {e}"
+                        f"opponent: "
+                        f"{e}"
                     )
 
-    opponents = get_opponents()
+    # --------------------------------------------------------
+    # VIEW OPPONENT
+    # --------------------------------------------------------
+
+    opponents = (
+        get_opponents()
+    )
 
     if not opponents:
 
-        st.info("No opponents yet.")
+        st.info(
+            "No opponents yet."
+        )
 
     else:
 
         opponent_names = [
             person["name"]
-            for person in opponents
+            for person
+            in opponents
         ]
 
-        selected_name = st.selectbox(
-            "View opponent",
-            opponent_names
+        selected_name = (
+            st.selectbox(
+                "View opponent",
+                opponent_names
+            )
         )
 
         selected = next(
             person
-            for person in opponents
-            if person["name"] == selected_name
+            for person
+            in opponents
+            if (
+                person["name"]
+                ==
+                selected_name
+            )
         )
 
         st.divider()
 
         st.header(
-            selected["name"]
+            selected[
+                "name"
+            ]
         )
 
         details = []
 
-        if selected.get("club"):
+        if selected.get(
+            "club"
+        ):
+
             details.append(
-                selected["club"]
+                selected[
+                    "club"
+                ]
             )
 
-        if selected.get("handedness"):
+        if selected.get(
+            "handedness"
+        ):
+
             details.append(
-                selected["handedness"]
+                selected[
+                    "handedness"
+                ]
             )
 
-        if selected.get("weapon"):
+        if selected.get(
+            "weapon"
+        ):
+
             details.append(
-                selected["weapon"]
+                selected[
+                    "weapon"
+                ]
             )
 
         if details:
 
             st.caption(
-                " • ".join(details)
+                " • ".join(
+                    details
+                )
             )
 
-        if selected.get("notes"):
+        if selected.get(
+            "notes"
+        ):
 
             st.write(
-                "**Opponent notes:**"
+                "**Opponent notes**"
             )
 
             st.write(
-                selected["notes"]
+                selected[
+                    "notes"
+                ]
             )
 
         # ----------------------------------------------------
-        # HEAD TO HEAD
+        # HEAD-TO-HEAD
         # ----------------------------------------------------
 
         opponent_bouts = (
@@ -714,7 +1395,9 @@ elif page == "👤 Opponents":
             .select("*")
             .eq(
                 "opponent_id",
-                selected["id"]
+                selected[
+                    "id"
+                ]
             )
             .order(
                 "created_at",
@@ -724,7 +1407,9 @@ elif page == "👤 Opponents":
             .data
         )
 
-        st.subheader("Head-to-head")
+        st.subheader(
+            "Head-to-head"
+        )
 
         if not opponent_bouts:
 
@@ -740,29 +1425,35 @@ elif page == "👤 Opponents":
             draws = 0
 
             total_margin = 0
-            total_feeling = 0
 
-            for bout in opponent_bouts:
+            for bout in (
+                opponent_bouts
+            ):
 
                 margin = (
-                    bout["my_score"]
-                    - bout["opponent_score"]
+                    bout[
+                        "my_score"
+                    ]
+                    -
+                    bout[
+                        "opponent_score"
+                    ]
                 )
 
-                total_margin += margin
-
-                if bout.get("feeling"):
-                    total_feeling += (
-                        bout["feeling"]
-                    )
+                total_margin += (
+                    margin
+                )
 
                 if margin > 0:
+
                     wins += 1
 
                 elif margin < 0:
+
                     losses += 1
 
                 else:
+
                     draws += 1
 
             bout_count = len(
@@ -780,13 +1471,16 @@ elif page == "👤 Opponents":
                 * 100
             )
 
-            col1, col2 = st.columns(2)
+            col1, col2 = (
+                st.columns(2)
+            )
 
             with col1:
 
                 st.metric(
                     "Record",
-                    f"{wins}–{losses}"
+                    f"{wins}W – "
+                    f"{losses}L"
                 )
 
             with col2:
@@ -796,12 +1490,14 @@ elif page == "👤 Opponents":
                     f"{win_rate:.0f}%"
                 )
 
-            col3, col4 = st.columns(2)
+            col3, col4 = (
+                st.columns(2)
+            )
 
             with col3:
 
                 st.metric(
-                    "Average margin",
+                    "Avg margin",
                     f"{average_margin:+.2f}"
                 )
 
@@ -812,23 +1508,79 @@ elif page == "👤 Opponents":
                     bout_count
                 )
 
+            # -----------------------------------------------
+            # LAST 5
+            # -----------------------------------------------
+
+            st.subheader(
+                "Last 5"
+            )
+
+            last_five = (
+                opponent_bouts[:5]
+            )
+
+            form = ""
+
+            for bout in reversed(
+                last_five
+            ):
+
+                if (
+                    bout["my_score"]
+                    >
+                    bout[
+                        "opponent_score"
+                    ]
+                ):
+
+                    form += "🟢 "
+
+                elif (
+                    bout["my_score"]
+                    <
+                    bout[
+                        "opponent_score"
+                    ]
+                ):
+
+                    form += "🔴 "
+
+                else:
+
+                    form += "⚪ "
+
+            st.write(form)
+
+            # -----------------------------------------------
+            # RECENT BOUTS
+            # -----------------------------------------------
+
             st.subheader(
                 "Recent bouts"
             )
 
-            for bout in opponent_bouts[:10]:
+            for bout in (
+                opponent_bouts[:10]
+            ):
 
                 my_score = (
-                    bout["my_score"]
+                    bout[
+                        "my_score"
+                    ]
                 )
 
                 their_score = (
-                    bout["opponent_score"]
+                    bout[
+                        "opponent_score"
+                    ]
                 )
 
-                result = get_result(
-                    my_score,
-                    their_score
+                result = (
+                    get_result_icon(
+                        my_score,
+                        their_score
+                    )
                 )
 
                 st.write(
@@ -837,10 +1589,14 @@ elif page == "👤 Opponents":
                     f"{their_score}**"
                 )
 
-                if bout.get("notes"):
+                if bout.get(
+                    "notes"
+                ):
 
                     st.caption(
-                        bout["notes"]
+                        bout[
+                            "notes"
+                        ]
                     )
 
 
@@ -850,7 +1606,9 @@ elif page == "👤 Opponents":
 
 elif page == "📚 Session History":
 
-    st.header("Session History")
+    st.header(
+        "Session History"
+    )
 
     sessions = (
         supabase
@@ -871,25 +1629,33 @@ elif page == "📚 Session History":
     if not sessions:
 
         st.info(
-            "No completed sessions yet."
+            "No completed "
+            "sessions yet."
         )
 
     else:
 
         session_lookup = {}
 
-        for session in sessions:
+        for session in (
+            sessions
+        ):
 
             label = (
-                f"{session['session_date']} • "
-                f"{session['session_type']} • "
+                f"{session['session_date']}"
+                f" • "
+                f"{session['session_type']}"
+                f" • "
                 f"{session['weapon']}"
             )
 
-            if session.get("location"):
+            if session.get(
+                "location"
+            ):
 
                 label += (
-                    f" • {session['location']}"
+                    f" • "
+                    f"{session['location']}"
                 )
 
             session_lookup[
@@ -925,7 +1691,9 @@ elif page == "📚 Session History":
             )
             .eq(
                 "session_id",
-                selected_session["id"]
+                selected_session[
+                    "id"
+                ]
             )
             .order(
                 "created_at"
@@ -936,32 +1704,54 @@ elif page == "📚 Session History":
 
         wins = 0
         losses = 0
+        draws = 0
+
         touches_for = 0
         touches_against = 0
 
-        for bout in session_bouts:
+        for bout in (
+            session_bouts
+        ):
 
             touches_for += (
-                bout["my_score"]
+                bout[
+                    "my_score"
+                ]
             )
 
             touches_against += (
-                bout["opponent_score"]
+                bout[
+                    "opponent_score"
+                ]
             )
 
             if (
-                bout["my_score"]
+                bout[
+                    "my_score"
+                ]
                 >
-                bout["opponent_score"]
+                bout[
+                    "opponent_score"
+                ]
             ):
+
                 wins += 1
 
             elif (
-                bout["my_score"]
+                bout[
+                    "my_score"
+                ]
                 <
-                bout["opponent_score"]
+                bout[
+                    "opponent_score"
+                ]
             ):
+
                 losses += 1
+
+            else:
+
+                draws += 1
 
         col1, col2, col3 = (
             st.columns(3)
@@ -971,7 +1761,9 @@ elif page == "📚 Session History":
 
             st.metric(
                 "Bouts",
-                len(session_bouts)
+                len(
+                    session_bouts
+                )
             )
 
         with col2:
@@ -985,7 +1777,8 @@ elif page == "📚 Session History":
 
             indicator = (
                 touches_for
-                - touches_against
+                -
+                touches_against
             )
 
             st.metric(
@@ -993,25 +1786,46 @@ elif page == "📚 Session History":
                 f"{indicator:+d}"
             )
 
-        if (
-            selected_session.get(
-                "overall_rating"
-            )
+        # ----------------------------------------------------
+        # SESSION NOTES
+        # ----------------------------------------------------
+
+        if selected_session.get(
+            "overall_rating"
         ):
 
             st.write(
                 "**Overall rating:** "
-                f"{selected_session['overall_rating']}/10"
+                f"{selected_session['overall_rating']}"
+                f"/10"
             )
 
-        if (
-            selected_session.get(
-                "what_i_learned"
-            )
+        if selected_session.get(
+            "energy_before"
         ):
 
             st.write(
-                "**What I learned**"
+                "**Starting energy:** "
+                f"{selected_session['energy_before']}"
+                f"/10"
+            )
+
+        if selected_session.get(
+            "confidence_before"
+        ):
+
+            st.write(
+                "**Starting confidence:** "
+                f"{selected_session['confidence_before']}"
+                f"/10"
+            )
+
+        if selected_session.get(
+            "what_i_learned"
+        ):
+
+            st.subheader(
+                "What I learned"
             )
 
             st.write(
@@ -1020,14 +1834,12 @@ elif page == "📚 Session History":
                 ]
             )
 
-        if (
-            selected_session.get(
-                "what_to_work_on"
-            )
+        if selected_session.get(
+            "what_to_work_on"
         ):
 
-            st.write(
-                "**What to work on**"
+            st.subheader(
+                "What to work on"
             )
 
             st.write(
@@ -1036,14 +1848,12 @@ elif page == "📚 Session History":
                 ]
             )
 
-        if (
-            selected_session.get(
-                "session_notes"
-            )
+        if selected_session.get(
+            "session_notes"
         ):
 
-            st.write(
-                "**Session diary**"
+            st.subheader(
+                "Session diary"
             )
 
             st.write(
@@ -1052,39 +1862,85 @@ elif page == "📚 Session History":
                 ]
             )
 
-        st.subheader("Bouts")
+        # ----------------------------------------------------
+        # SESSION BOUTS
+        # ----------------------------------------------------
 
-        for bout in session_bouts:
+        st.divider()
 
-            opponent = (
-                bout["opponents"]["name"]
+        st.subheader(
+            "Bouts"
+        )
+
+        if not session_bouts:
+
+            st.info(
+                "No bouts recorded "
+                "in this session."
             )
 
-            my_score = (
-                bout["my_score"]
-            )
+        else:
 
-            their_score = (
-                bout["opponent_score"]
-            )
+            for bout in (
+                session_bouts
+            ):
 
-            result = get_result(
-                my_score,
-                their_score
-            )
-
-            st.write(
-                f"**{result} "
-                f"{my_score}–"
-                f"{their_score}** "
-                f"vs {opponent}"
-            )
-
-            if bout.get("notes"):
-
-                st.caption(
-                    bout["notes"]
+                opponent_data = (
+                    bout.get(
+                        "opponents"
+                    )
                 )
+
+                if opponent_data:
+
+                    opponent = (
+                        opponent_data[
+                            "name"
+                        ]
+                    )
+
+                else:
+
+                    opponent = (
+                        "Unknown"
+                    )
+
+                my_score = (
+                    bout[
+                        "my_score"
+                    ]
+                )
+
+                their_score = (
+                    bout[
+                        "opponent_score"
+                    ]
+                )
+
+                result = (
+                    get_result_icon(
+                        my_score,
+                        their_score
+                    )
+                )
+
+                st.write(
+                    f"**{result} "
+                    f"{my_score}–"
+                    f"{their_score}** "
+                    f"vs "
+                    f"{opponent}"
+                )
+
+                if bout.get(
+                    "notes"
+                ):
+
+                    st.caption(
+                        bout[
+                            "notes"
+                        ]
+                    )
 
 
 # ============================================================
@@ -1093,9 +1949,13 @@ elif page == "📚 Session History":
 
 elif page == "📖 Bout History":
 
-    st.header("Bout History")
+    st.header(
+        "Bout History"
+    )
 
-    bouts = get_bouts()
+    bouts = (
+        get_bouts()
+    )
 
     if not bouts:
 
@@ -1103,61 +1963,112 @@ elif page == "📖 Bout History":
             "No bouts recorded yet."
         )
 
-    for bout in bouts:
+    else:
 
-        opponent = (
-            bout["opponents"]["name"]
-        )
+        for bout in bouts:
 
-        my_score = bout["my_score"]
-
-        their_score = (
-            bout["opponent_score"]
-        )
-
-        result = get_result(
-            my_score,
-            their_score
-        )
-
-        st.subheader(
-            f"{result} "
-            f"{my_score}–"
-            f"{their_score} "
-            f"vs {opponent}"
-        )
-
-        st.caption(
-            f"Fencing rating: "
-            f"{bout['feeling']}/10"
-        )
-
-        if bout.get("notes"):
-
-            st.write(
-                bout["notes"]
+            opponent_data = (
+                bout.get(
+                    "opponents"
+                )
             )
 
-        if bout.get(
-            "what_worked"
-        ):
+            if opponent_data:
 
-            st.write(
-                "**Worked:** "
-                + bout[
-                    "what_worked"
+                opponent = (
+                    opponent_data[
+                        "name"
+                    ]
+                )
+
+            else:
+
+                opponent = (
+                    "Unknown opponent"
+                )
+
+            my_score = (
+                bout[
+                    "my_score"
                 ]
             )
 
-        if bout.get(
-            "what_didnt"
-        ):
-
-            st.write(
-                "**Didn't work:** "
-                + bout[
-                    "what_didnt"
+            their_score = (
+                bout[
+                    "opponent_score"
                 ]
             )
 
-        st.divider()
+            result = (
+                get_result_icon(
+                    my_score,
+                    their_score
+                )
+            )
+
+            st.subheader(
+                f"{result} "
+                f"{my_score}–"
+                f"{their_score} "
+                f"vs "
+                f"{opponent}"
+            )
+
+            if bout.get(
+                "created_at"
+            ):
+
+                created = (
+                    bout[
+                        "created_at"
+                    ][:10]
+                )
+
+                st.caption(
+                    created
+                )
+
+            if bout.get(
+                "feeling"
+            ) is not None:
+
+                st.write(
+                    "**How well I fenced:** "
+                    f"{bout['feeling']}/10"
+                )
+
+            if bout.get(
+                "notes"
+            ):
+
+                st.write(
+                    bout[
+                        "notes"
+                    ]
+                )
+
+            if bout.get(
+                "what_worked"
+            ):
+
+                st.write(
+                    "**Worked:** "
+                    +
+                    bout[
+                        "what_worked"
+                    ]
+                )
+
+            if bout.get(
+                "what_didnt"
+            ):
+
+                st.write(
+                    "**Didn't work:** "
+                    +
+                    bout[
+                        "what_didnt"
+                    ]
+                )
+
+            st.divider()
