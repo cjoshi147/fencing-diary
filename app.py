@@ -2,10 +2,6 @@ import streamlit as st
 from supabase import create_client
 from datetime import date, datetime, timezone
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
-
 st.set_page_config(
     page_title="Fencing Diary",
     page_icon="🤺",
@@ -20,9 +16,9 @@ supabase = create_client(
 st.title("🤺 Fencing Diary")
 
 
-# --------------------------------------------------
+# ============================================================
 # HELPERS
-# --------------------------------------------------
+# ============================================================
 
 def get_active_session():
     response = (
@@ -42,42 +38,64 @@ def get_active_session():
 
 
 def get_opponents():
-    response = (
+    return (
         supabase
         .table("opponents")
-        .select("id,name")
+        .select("*")
         .order("name")
         .execute()
+        .data
     )
 
-    return response.data
+
+def get_bouts():
+    return (
+        supabase
+        .table("bouts")
+        .select("*, opponents(name)")
+        .order("created_at", desc=True)
+        .execute()
+        .data
+    )
 
 
-# --------------------------------------------------
+def get_result(my_score, their_score):
+
+    if my_score > their_score:
+        return "W"
+
+    elif my_score < their_score:
+        return "L"
+
+    return "D"
+
+
+# ============================================================
 # NAVIGATION
-# --------------------------------------------------
+# ============================================================
 
 page = st.sidebar.radio(
     "Menu",
     [
         "🤺 Current Session",
         "👤 Opponents",
+        "📚 Session History",
         "📖 Bout History"
     ]
 )
 
 
-# ==================================================
+# ============================================================
 # CURRENT SESSION
-# ==================================================
+# ============================================================
 
 if page == "🤺 Current Session":
 
     active_session = get_active_session()
 
-    # ----------------------------------------------
-    # NO ACTIVE SESSION
-    # ----------------------------------------------
+    # --------------------------------------------------------
+    # START SESSION
+    # --------------------------------------------------------
 
     if active_session is None:
 
@@ -115,6 +133,7 @@ if page == "🤺 Current Session":
             col1, col2 = st.columns(2)
 
             with col1:
+
                 energy_before = st.slider(
                     "Energy",
                     1,
@@ -123,6 +142,7 @@ if page == "🤺 Current Session":
                 )
 
             with col2:
+
                 confidence_before = st.slider(
                     "Confidence",
                     1,
@@ -139,20 +159,32 @@ if page == "🤺 Current Session":
         if start:
 
             supabase.table("sessions").insert({
-                "session_date": str(session_date),
-                "session_type": session_type,
-                "weapon": weapon,
-                "location": location.strip(),
-                "energy_before": energy_before,
-                "confidence_before": confidence_before
+
+                "session_date":
+                    str(session_date),
+
+                "session_type":
+                    session_type,
+
+                "weapon":
+                    weapon,
+
+                "location":
+                    location.strip(),
+
+                "energy_before":
+                    energy_before,
+
+                "confidence_before":
+                    confidence_before
+
             }).execute()
 
             st.rerun()
 
-
-    # ----------------------------------------------
+    # --------------------------------------------------------
     # ACTIVE SESSION
-    # ----------------------------------------------
+    # --------------------------------------------------------
 
     else:
 
@@ -163,13 +195,10 @@ if page == "🤺 Current Session":
         )
 
         if active_session.get("location"):
+
             st.caption(
                 f"📍 {active_session['location']}"
             )
-
-        # ------------------------------------------
-        # LOAD CURRENT BOUTS
-        # ------------------------------------------
 
         bouts_response = (
             supabase
@@ -187,47 +216,44 @@ if page == "🤺 Current Session":
 
         wins = 0
         losses = 0
-        draws = 0
         touches_for = 0
         touches_against = 0
 
         for bout in session_bouts:
 
-            my_score = bout["my_score"]
-            their_score = bout["opponent_score"]
+            touches_for += bout["my_score"]
+            touches_against += bout["opponent_score"]
 
-            touches_for += my_score
-            touches_against += their_score
-
-            if my_score > their_score:
+            if bout["my_score"] > bout["opponent_score"]:
                 wins += 1
-            elif my_score < their_score:
-                losses += 1
-            else:
-                draws += 1
 
-        # ------------------------------------------
-        # SESSION SCOREBOARD
-        # ------------------------------------------
+            elif bout["my_score"] < bout["opponent_score"]:
+                losses += 1
 
         st.subheader("Current session")
 
         col1, col2, col3 = st.columns(3)
 
         with col1:
+
             st.metric(
                 "Bouts",
                 len(session_bouts)
             )
 
         with col2:
+
             st.metric(
                 "Record",
                 f"{wins}–{losses}"
             )
 
         with col3:
-            indicator = touches_for - touches_against
+
+            indicator = (
+                touches_for
+                - touches_against
+            )
 
             st.metric(
                 "Indicator",
@@ -236,9 +262,9 @@ if page == "🤺 Current Session":
 
         st.divider()
 
-        # ------------------------------------------
-        # QUICK BOUT LOGGER
-        # ------------------------------------------
+        # ----------------------------------------------------
+        # QUICK LOGGER
+        # ----------------------------------------------------
 
         st.header("⚡ Log Bout")
 
@@ -247,13 +273,15 @@ if page == "🤺 Current Session":
         if not opponents:
 
             st.warning(
-                "You need to add an opponent first."
+                "Add an opponent first."
             )
 
         else:
 
             opponent_lookup = {
-                person["name"]: person["id"]
+                person["name"]:
+                    person["id"]
+
                 for person in opponents
             }
 
@@ -264,14 +292,16 @@ if page == "🤺 Current Session":
 
                 opponent_name = st.selectbox(
                     "Opponent",
-                    list(opponent_lookup.keys())
+                    list(
+                        opponent_lookup.keys()
+                    )
                 )
 
-                score1, middle, score2 = st.columns(
+                left, middle, right = st.columns(
                     [4, 1, 4]
                 )
 
-                with score1:
+                with left:
 
                     my_score = st.number_input(
                         "You",
@@ -284,19 +314,21 @@ if page == "🤺 Current Session":
                 with middle:
 
                     st.markdown(
-                        "<h2 style='text-align:center; "
+                        "<h2 style='text-align:center;"
                         "padding-top:22px;'>–</h2>",
                         unsafe_allow_html=True
                     )
 
-                with score2:
+                with right:
 
-                    opponent_score = st.number_input(
-                        "Them",
-                        min_value=0,
-                        max_value=50,
-                        value=3,
-                        step=1
+                    opponent_score = (
+                        st.number_input(
+                            "Them",
+                            min_value=0,
+                            max_value=50,
+                            value=3,
+                            step=1
+                        )
                     )
 
                 feeling = st.slider(
@@ -309,33 +341,42 @@ if page == "🤺 Current Session":
                 quick_note = st.text_area(
                     "Quick note",
                     placeholder=(
-                        "e.g. Distance good. "
-                        "Disengage worked well."
+                        "Distance good, "
+                        "disengage worked..."
                     ),
                     height=80
                 )
 
                 with st.expander(
-                    "Add detailed notes"
+                    "Detailed notes"
                 ):
 
-                    what_worked = st.text_area(
-                        "What worked?"
+                    what_worked = (
+                        st.text_area(
+                            "What worked?"
+                        )
                     )
 
-                    what_didnt = st.text_area(
-                        "What didn't work?"
+                    what_didnt = (
+                        st.text_area(
+                            "What didn't work?"
+                        )
                     )
 
-                save_bout = st.form_submit_button(
-                    "SAVE + NEXT BOUT",
-                    type="primary",
-                    use_container_width=True
+                save_bout = (
+                    st.form_submit_button(
+                        "SAVE + NEXT BOUT",
+                        type="primary",
+                        use_container_width=True
+                    )
                 )
 
             if save_bout:
 
-                supabase.table("bouts").insert({
+                supabase.table(
+                    "bouts"
+                ).insert({
+
                     "session_id":
                         active_session["id"],
 
@@ -361,6 +402,7 @@ if page == "🤺 Current Session":
 
                     "notes":
                         quick_note
+
                 }).execute()
 
                 st.toast(
@@ -372,9 +414,9 @@ if page == "🤺 Current Session":
 
                 st.rerun()
 
-        # ------------------------------------------
-        # RECENT BOUTS
-        # ------------------------------------------
+        # ----------------------------------------------------
+        # CURRENT BOUTS
+        # ----------------------------------------------------
 
         if session_bouts:
 
@@ -382,7 +424,6 @@ if page == "🤺 Current Session":
 
             st.subheader("This session")
 
-            # newest first
             for bout in reversed(
                 session_bouts
             ):
@@ -397,14 +438,10 @@ if page == "🤺 Current Session":
                     bout["opponent_score"]
                 )
 
-                if my_score > their_score:
-                    result = "🟢 W"
-
-                elif my_score < their_score:
-                    result = "🔴 L"
-
-                else:
-                    result = "⚪ D"
+                result = get_result(
+                    my_score,
+                    their_score
+                )
 
                 st.write(
                     f"**{result} "
@@ -419,9 +456,9 @@ if page == "🤺 Current Session":
                         bout["notes"]
                     )
 
-        # ------------------------------------------
+        # ----------------------------------------------------
         # END SESSION
-        # ------------------------------------------
+        # ----------------------------------------------------
 
         st.divider()
 
@@ -433,24 +470,32 @@ if page == "🤺 Current Session":
                 "finish_session"
             ):
 
-                overall_rating = st.slider(
-                    "Overall session",
-                    1,
-                    10,
-                    5
+                overall_rating = (
+                    st.slider(
+                        "Overall session",
+                        1,
+                        10,
+                        5
+                    )
                 )
 
-                what_i_learned = st.text_area(
-                    "What did you learn?"
+                what_i_learned = (
+                    st.text_area(
+                        "What did you learn?"
+                    )
                 )
 
-                what_to_work_on = st.text_area(
-                    "What should you work on?"
+                what_to_work_on = (
+                    st.text_area(
+                        "What should you work on?"
+                    )
                 )
 
-                session_notes = st.text_area(
-                    "General session diary",
-                    height=120
+                session_notes = (
+                    st.text_area(
+                        "General session diary",
+                        height=120
+                    )
                 )
 
                 end_session = (
@@ -495,17 +540,16 @@ if page == "🤺 Current Session":
                 st.rerun()
 
 
-# ==================================================
+# ============================================================
 # OPPONENTS
-# ==================================================
+# ============================================================
 
 elif page == "👤 Opponents":
 
     st.header("Opponents")
 
     with st.expander(
-        "➕ Add opponent",
-        expanded=False
+        "➕ Add opponent"
     ):
 
         with st.form(
@@ -537,6 +581,10 @@ elif page == "👤 Opponents":
                     "Foil",
                     "Sabre"
                 ]
+            )
+
+            notes = st.text_area(
+                "Opponent notes"
             )
 
             add_opponent = (
@@ -573,7 +621,10 @@ elif page == "👤 Opponents":
                             handedness,
 
                         "weapon":
-                            weapon
+                            weapon,
+
+                        "notes":
+                            notes
 
                     }).execute()
 
@@ -590,73 +641,461 @@ elif page == "👤 Opponents":
                         f"opponent: {e}"
                     )
 
-    opponents = (
-        supabase
-        .table("opponents")
-        .select("*")
-        .order("name")
-        .execute()
-        .data
-    )
+    opponents = get_opponents()
 
     if not opponents:
 
-        st.info(
-            "No opponents yet."
+        st.info("No opponents yet.")
+
+    else:
+
+        opponent_names = [
+            person["name"]
+            for person in opponents
+        ]
+
+        selected_name = st.selectbox(
+            "View opponent",
+            opponent_names
         )
 
-    for person in opponents:
+        selected = next(
+            person
+            for person in opponents
+            if person["name"] == selected_name
+        )
 
-        st.subheader(
-            person["name"]
+        st.divider()
+
+        st.header(
+            selected["name"]
         )
 
         details = []
 
-        if person.get("club"):
+        if selected.get("club"):
             details.append(
-                person["club"]
+                selected["club"]
             )
 
-        if person.get("handedness"):
+        if selected.get("handedness"):
             details.append(
-                person["handedness"]
+                selected["handedness"]
             )
 
-        if person.get("weapon"):
+        if selected.get("weapon"):
             details.append(
-                person["weapon"]
+                selected["weapon"]
             )
 
         if details:
+
             st.caption(
                 " • ".join(details)
             )
 
-        st.divider()
+        if selected.get("notes"):
+
+            st.write(
+                "**Opponent notes:**"
+            )
+
+            st.write(
+                selected["notes"]
+            )
+
+        # ----------------------------------------------------
+        # HEAD TO HEAD
+        # ----------------------------------------------------
+
+        opponent_bouts = (
+            supabase
+            .table("bouts")
+            .select("*")
+            .eq(
+                "opponent_id",
+                selected["id"]
+            )
+            .order(
+                "created_at",
+                desc=True
+            )
+            .execute()
+            .data
+        )
+
+        st.subheader("Head-to-head")
+
+        if not opponent_bouts:
+
+            st.info(
+                "No bouts recorded "
+                "against this opponent."
+            )
+
+        else:
+
+            wins = 0
+            losses = 0
+            draws = 0
+
+            total_margin = 0
+            total_feeling = 0
+
+            for bout in opponent_bouts:
+
+                margin = (
+                    bout["my_score"]
+                    - bout["opponent_score"]
+                )
+
+                total_margin += margin
+
+                if bout.get("feeling"):
+                    total_feeling += (
+                        bout["feeling"]
+                    )
+
+                if margin > 0:
+                    wins += 1
+
+                elif margin < 0:
+                    losses += 1
+
+                else:
+                    draws += 1
+
+            bout_count = len(
+                opponent_bouts
+            )
+
+            average_margin = (
+                total_margin
+                / bout_count
+            )
+
+            win_rate = (
+                wins
+                / bout_count
+                * 100
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+
+                st.metric(
+                    "Record",
+                    f"{wins}–{losses}"
+                )
+
+            with col2:
+
+                st.metric(
+                    "Win rate",
+                    f"{win_rate:.0f}%"
+                )
+
+            col3, col4 = st.columns(2)
+
+            with col3:
+
+                st.metric(
+                    "Average margin",
+                    f"{average_margin:+.2f}"
+                )
+
+            with col4:
+
+                st.metric(
+                    "Total bouts",
+                    bout_count
+                )
+
+            st.subheader(
+                "Recent bouts"
+            )
+
+            for bout in opponent_bouts[:10]:
+
+                my_score = (
+                    bout["my_score"]
+                )
+
+                their_score = (
+                    bout["opponent_score"]
+                )
+
+                result = get_result(
+                    my_score,
+                    their_score
+                )
+
+                st.write(
+                    f"**{result} "
+                    f"{my_score}–"
+                    f"{their_score}**"
+                )
+
+                if bout.get("notes"):
+
+                    st.caption(
+                        bout["notes"]
+                    )
 
 
-# ==================================================
-# BOUT HISTORY
-# ==================================================
+# ============================================================
+# SESSION HISTORY
+# ============================================================
 
-elif page == "📖 Bout History":
+elif page == "📚 Session History":
 
-    st.header("Bout History")
+    st.header("Session History")
 
-    bouts = (
+    sessions = (
         supabase
-        .table("bouts")
-        .select(
-            "*, opponents(name)"
+        .table("sessions")
+        .select("*")
+        .not_.is_(
+            "ended_at",
+            "null"
         )
         .order(
-            "created_at",
+            "session_date",
             desc=True
         )
         .execute()
         .data
     )
+
+    if not sessions:
+
+        st.info(
+            "No completed sessions yet."
+        )
+
+    else:
+
+        session_lookup = {}
+
+        for session in sessions:
+
+            label = (
+                f"{session['session_date']} • "
+                f"{session['session_type']} • "
+                f"{session['weapon']}"
+            )
+
+            if session.get("location"):
+
+                label += (
+                    f" • {session['location']}"
+                )
+
+            session_lookup[
+                label
+            ] = session
+
+        selected_label = (
+            st.selectbox(
+                "Select session",
+                list(
+                    session_lookup.keys()
+                )
+            )
+        )
+
+        selected_session = (
+            session_lookup[
+                selected_label
+            ]
+        )
+
+        st.divider()
+
+        st.header(
+            selected_label
+        )
+
+        session_bouts = (
+            supabase
+            .table("bouts")
+            .select(
+                "*, opponents(name)"
+            )
+            .eq(
+                "session_id",
+                selected_session["id"]
+            )
+            .order(
+                "created_at"
+            )
+            .execute()
+            .data
+        )
+
+        wins = 0
+        losses = 0
+        touches_for = 0
+        touches_against = 0
+
+        for bout in session_bouts:
+
+            touches_for += (
+                bout["my_score"]
+            )
+
+            touches_against += (
+                bout["opponent_score"]
+            )
+
+            if (
+                bout["my_score"]
+                >
+                bout["opponent_score"]
+            ):
+                wins += 1
+
+            elif (
+                bout["my_score"]
+                <
+                bout["opponent_score"]
+            ):
+                losses += 1
+
+        col1, col2, col3 = (
+            st.columns(3)
+        )
+
+        with col1:
+
+            st.metric(
+                "Bouts",
+                len(session_bouts)
+            )
+
+        with col2:
+
+            st.metric(
+                "Record",
+                f"{wins}–{losses}"
+            )
+
+        with col3:
+
+            indicator = (
+                touches_for
+                - touches_against
+            )
+
+            st.metric(
+                "Indicator",
+                f"{indicator:+d}"
+            )
+
+        if (
+            selected_session.get(
+                "overall_rating"
+            )
+        ):
+
+            st.write(
+                "**Overall rating:** "
+                f"{selected_session['overall_rating']}/10"
+            )
+
+        if (
+            selected_session.get(
+                "what_i_learned"
+            )
+        ):
+
+            st.write(
+                "**What I learned**"
+            )
+
+            st.write(
+                selected_session[
+                    "what_i_learned"
+                ]
+            )
+
+        if (
+            selected_session.get(
+                "what_to_work_on"
+            )
+        ):
+
+            st.write(
+                "**What to work on**"
+            )
+
+            st.write(
+                selected_session[
+                    "what_to_work_on"
+                ]
+            )
+
+        if (
+            selected_session.get(
+                "session_notes"
+            )
+        ):
+
+            st.write(
+                "**Session diary**"
+            )
+
+            st.write(
+                selected_session[
+                    "session_notes"
+                ]
+            )
+
+        st.subheader("Bouts")
+
+        for bout in session_bouts:
+
+            opponent = (
+                bout["opponents"]["name"]
+            )
+
+            my_score = (
+                bout["my_score"]
+            )
+
+            their_score = (
+                bout["opponent_score"]
+            )
+
+            result = get_result(
+                my_score,
+                their_score
+            )
+
+            st.write(
+                f"**{result} "
+                f"{my_score}–"
+                f"{their_score}** "
+                f"vs {opponent}"
+            )
+
+            if bout.get("notes"):
+
+                st.caption(
+                    bout["notes"]
+                )
+
+
+# ============================================================
+# BOUT HISTORY
+# ============================================================
+
+elif page == "📖 Bout History":
+
+    st.header("Bout History")
+
+    bouts = get_bouts()
 
     if not bouts:
 
@@ -676,18 +1115,15 @@ elif page == "📖 Bout History":
             bout["opponent_score"]
         )
 
-        if my_score > their_score:
-            result = "🟢 W"
-
-        elif my_score < their_score:
-            result = "🔴 L"
-
-        else:
-            result = "⚪ D"
+        result = get_result(
+            my_score,
+            their_score
+        )
 
         st.subheader(
             f"{result} "
-            f"{my_score}–{their_score} "
+            f"{my_score}–"
+            f"{their_score} "
             f"vs {opponent}"
         )
 
@@ -702,18 +1138,26 @@ elif page == "📖 Bout History":
                 bout["notes"]
             )
 
-        if bout.get("what_worked"):
+        if bout.get(
+            "what_worked"
+        ):
 
             st.write(
                 "**Worked:** "
-                + bout["what_worked"]
+                + bout[
+                    "what_worked"
+                ]
             )
 
-        if bout.get("what_didnt"):
+        if bout.get(
+            "what_didnt"
+        ):
 
             st.write(
                 "**Didn't work:** "
-                + bout["what_didnt"]
+                + bout[
+                    "what_didnt"
+                ]
             )
 
         st.divider()
