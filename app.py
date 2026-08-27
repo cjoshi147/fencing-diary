@@ -1,4 +1,6 @@
+
 import streamlit as st
+import pandas as pd
 from supabase import create_client
 from datetime import date, datetime, timezone
 
@@ -10,54 +12,70 @@ from datetime import date, datetime, timezone
 st.set_page_config(
     page_title="Fencing Diary",
     page_icon="🤺",
-    layout="centered"
+    layout="centered",
 )
-
-
-# ============================================================
-# SUPABASE CONNECTION
-# ============================================================
 
 supabase = create_client(
     st.secrets["SUPABASE_URL"],
-    st.secrets["SUPABASE_KEY"]
+    st.secrets["SUPABASE_KEY"],
 )
-
-
-# ============================================================
-# TITLE
-# ============================================================
 
 st.title("🤺 Fencing Diary")
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
-def get_active_session():
+def clean_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
 
+
+def clean_int(value):
+    if value is None or pd.isna(value) or clean_text(value) == "":
+        return None
+    return int(float(value))
+
+
+def normalize_name(value):
+    return " ".join(clean_text(value).casefold().split())
+
+
+def canonical_weapon(value):
+    raw = normalize_name(value)
+    if raw in {"epee", "épée"}:
+        return "Épée"
+    if raw == "foil":
+        return "Foil"
+    if raw in {"sabre", "saber"}:
+        return "Sabre"
+    return clean_text(value) or "Épée"
+
+
+def get_result_icon(my_score, their_score):
+    if my_score > their_score:
+        return "🟢 W"
+    if my_score < their_score:
+        return "🔴 L"
+    return "⚪ D"
+
+
+def get_active_session():
     response = (
         supabase
         .table("sessions")
         .select("*")
         .is_("ended_at", "null")
-        .order(
-            "created_at",
-            desc=True
-        )
+        .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
-
-    if response.data:
-        return response.data[0]
-
-    return None
+    return response.data[0] if response.data else None
 
 
 def get_opponents():
-
     return (
         supabase
         .table("opponents")
@@ -68,64 +86,484 @@ def get_opponents():
     )
 
 
-def get_bouts():
+def opponent_map():
+    return {row["id"]: row for row in get_opponents()}
 
-    return (
+
+def get_bouts():
+    rows = (
         supabase
         .table("bouts")
-        .select(
-            "*, opponents(name)"
-        )
-        .order(
-            "created_at",
-            desc=True
-        )
+        .select("*")
+        .order("created_at", desc=True)
         .execute()
         .data
     )
+    people = opponent_map()
+    for row in rows:
+        row["opponent"] = people.get(row.get("opponent_id"))
+    return rows
 
 
 def get_sessions():
-
     return (
         supabase
         .table("sessions")
         .select("*")
-        .order(
-            "session_date",
-            desc=True
-        )
+        .order("session_date", desc=True)
         .execute()
         .data
     )
 
 
-def get_result(
-    my_score,
-    their_score
-):
-
-    if my_score > their_score:
-        return "W"
-
-    elif my_score < their_score:
-        return "L"
-
-    return "D"
+def get_competitions():
+    return (
+        supabase
+        .table("competitions")
+        .select("*")
+        .order("competition_date", desc=True)
+        .execute()
+        .data
+    )
 
 
-def get_result_icon(
-    my_score,
-    their_score
-):
+def get_competition_fencers(competition_id):
+    rows = (
+        supabase
+        .table("competition_fencers")
+        .select("*")
+        .eq("competition_id", competition_id)
+        .execute()
+        .data
+    )
+    people = opponent_map()
+    for row in rows:
+        row["person"] = people.get(row.get("opponent_id"))
+    return rows
 
-    if my_score > their_score:
-        return "🟢 W"
 
-    elif my_score < their_score:
-        return "🔴 L"
+def get_competition_bouts(competition_id):
+    rows = (
+        supabase
+        .table("competition_bouts")
+        .select("*")
+        .eq("competition_id", competition_id)
+        .order("id")
+        .execute()
+        .data
+    )
+    people = opponent_map()
+    for row in rows:
+        row["fencer_a"] = people.get(row.get("fencer_a_id"))
+        row["fencer_b"] = people.get(row.get("fencer_b_id"))
+    return rows
 
-    return "⚪ D"
+
+def canonical_bout_signature(stage, poule_number, round_name, a_id, score_a, b_id, score_b):
+    stage = clean_text(stage)
+    poule_number = clean_int(poule_number)
+    round_name = clean_text(round_name)
+
+    if a_id <= b_id:
+        return (
+            stage,
+            poule_number,
+            round_name,
+            int(a_id),
+            int(score_a),
+            int(b_id),
+            int(score_b),
+        )
+
+    return (
+        stage,
+        poule_number,
+        round_name,
+        int(b_id),
+        int(score_b),
+        int(a_id),
+        int(score_a),
+    )
+
+
+# ============================================================
+# IMPORT HELPERS
+# ============================================================
+
+IMPORT_REQUIRED_COLUMNS = {
+    "row_type",
+    "competition_name",
+    "competition_date",
+    "weapon",
+    "name",
+    "club",
+    "region",
+    "initial_seed",
+    "de_seed",
+    "final_place",
+    "final_place_label",
+    "stage",
+    "poule_number",
+    "round_name",
+    "fencer_a",
+    "score_a",
+    "fencer_b",
+    "score_b",
+}
+
+
+def validate_import(df):
+    missing = sorted(IMPORT_REQUIRED_COLUMNS - set(df.columns))
+    errors = []
+
+    if missing:
+        errors.append("Missing columns: " + ", ".join(missing))
+        return errors
+
+    row_types = {
+        normalize_name(x).upper()
+        for x in df["row_type"].dropna().tolist()
+    }
+
+    if "COMPETITION" not in row_types:
+        errors.append("No COMPETITION row found.")
+
+    if "FENCER" not in row_types:
+        errors.append("No FENCER rows found.")
+
+    if "BOUT" not in row_types:
+        errors.append("No BOUT rows found.")
+
+    competition_rows = df[
+        df["row_type"].astype(str).str.upper() == "COMPETITION"
+    ]
+
+    if len(competition_rows) != 1:
+        errors.append(
+            f"Expected exactly 1 COMPETITION row, found {len(competition_rows)}."
+        )
+
+    return errors
+
+
+def parse_import(df):
+    work = df.copy()
+    work["row_type"] = work["row_type"].astype(str).str.upper().str.strip()
+
+    competition_row = work[work["row_type"] == "COMPETITION"].iloc[0]
+
+    competition = {
+        "name": clean_text(competition_row.get("competition_name")),
+        "competition_date": clean_text(competition_row.get("competition_date")),
+        "event_name": clean_text(competition_row.get("event_name")),
+        "weapon": canonical_weapon(competition_row.get("weapon")),
+        "location": clean_text(competition_row.get("location")),
+        "level": clean_text(competition_row.get("level")),
+        "field_size": clean_int(competition_row.get("field_size")),
+    }
+
+    fencer_rows = work[work["row_type"] == "FENCER"]
+    fencers = []
+
+    for _, row in fencer_rows.iterrows():
+        name = clean_text(row.get("name"))
+        if not name:
+            continue
+
+        fencers.append({
+            "source_name": clean_text(row.get("source_name")),
+            "name": name,
+            "club": clean_text(row.get("club")),
+            "region": clean_text(row.get("region")),
+            "initial_seed": clean_int(row.get("initial_seed")),
+            "de_seed": clean_int(row.get("de_seed")),
+            "final_place": clean_int(row.get("final_place")),
+            "final_place_label": clean_text(row.get("final_place_label")),
+        })
+
+    bout_rows = work[work["row_type"] == "BOUT"]
+    bouts = []
+
+    for _, row in bout_rows.iterrows():
+        fencer_a = clean_text(row.get("fencer_a"))
+        fencer_b = clean_text(row.get("fencer_b"))
+
+        if not fencer_a or not fencer_b:
+            continue
+
+        bouts.append({
+            "stage": clean_text(row.get("stage")),
+            "poule_number": clean_int(row.get("poule_number")),
+            "round_name": clean_text(row.get("round_name")),
+            "fencer_a": fencer_a,
+            "score_a": clean_int(row.get("score_a")),
+            "fencer_b": fencer_b,
+            "score_b": clean_int(row.get("score_b")),
+        })
+
+    return competition, fencers, bouts
+
+
+def find_existing_competition(comp):
+    query = (
+        supabase
+        .table("competitions")
+        .select("*")
+        .eq("name", comp["name"])
+        .eq("competition_date", comp["competition_date"])
+        .eq("weapon", comp["weapon"])
+        .limit(1)
+        .execute()
+    )
+
+    return query.data[0] if query.data else None
+
+
+def find_exact_opponent(imported_fencer, existing_opponents):
+    imported_names = {
+        normalize_name(imported_fencer["name"]),
+        normalize_name(imported_fencer.get("source_name")),
+    }
+    imported_names.discard("")
+
+    matches = []
+
+    for opponent in existing_opponents:
+        if normalize_name(opponent["name"]) in imported_names:
+            matches.append(opponent)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+def import_competition_data(comp, imported_fencers, imported_bouts, name_choices):
+    existing_comp = find_existing_competition(comp)
+
+    competition_payload = {
+        "name": comp["name"],
+        "competition_date": comp["competition_date"],
+        "event_name": comp["event_name"] or None,
+        "weapon": comp["weapon"],
+        "location": comp["location"] or None,
+        "level": comp["level"] or None,
+        "field_size": comp["field_size"],
+    }
+
+    if existing_comp:
+        competition_id = existing_comp["id"]
+
+        supabase.table("competitions").update(
+            competition_payload
+        ).eq(
+            "id",
+            competition_id
+        ).execute()
+
+        competition_created = False
+
+    else:
+        result = (
+            supabase
+            .table("competitions")
+            .insert(competition_payload)
+            .execute()
+        )
+
+        competition_id = result.data[0]["id"]
+        competition_created = True
+
+    existing_opponents = get_opponents()
+    opponent_by_id = {row["id"]: row for row in existing_opponents}
+    opponent_by_norm_name = {
+        normalize_name(row["name"]): row
+        for row in existing_opponents
+    }
+
+    imported_name_to_id = {}
+    new_fencer_count = 0
+
+    for index, fencer in enumerate(imported_fencers):
+        exact = find_exact_opponent(fencer, existing_opponents)
+
+        if exact:
+            opponent_id = exact["id"]
+
+            update_payload = {}
+
+            if fencer["club"] and not clean_text(exact.get("club")):
+                update_payload["club"] = fencer["club"]
+
+            if fencer["region"] and not clean_text(exact.get("region")):
+                update_payload["region"] = fencer["region"]
+
+            if not clean_text(exact.get("weapon")):
+                update_payload["weapon"] = comp["weapon"]
+
+            if update_payload:
+                supabase.table("opponents").update(
+                    update_payload
+                ).eq(
+                    "id",
+                    opponent_id
+                ).execute()
+
+        else:
+            selected = name_choices.get(index, "➕ Create new fencer")
+
+            if selected != "➕ Create new fencer":
+                match = opponent_by_norm_name.get(normalize_name(selected))
+
+                if not match:
+                    raise ValueError(
+                        f"Could not resolve selected match for {fencer['name']}."
+                    )
+
+                opponent_id = match["id"]
+
+            else:
+                result = (
+                    supabase
+                    .table("opponents")
+                    .insert({
+                        "name": fencer["name"],
+                        "club": fencer["club"] or None,
+                        "region": fencer["region"] or None,
+                        "handedness": "Unknown",
+                        "weapon": comp["weapon"],
+                    })
+                    .execute()
+                )
+
+                opponent_id = result.data[0]["id"]
+                new_fencer_count += 1
+
+                new_person = result.data[0]
+                existing_opponents.append(new_person)
+                opponent_by_id[opponent_id] = new_person
+                opponent_by_norm_name[normalize_name(new_person["name"])] = new_person
+
+        imported_name_to_id[normalize_name(fencer["name"])] = opponent_id
+
+        if fencer.get("source_name"):
+            imported_name_to_id[
+                normalize_name(fencer["source_name"])
+            ] = opponent_id
+
+    existing_comp_fencers = get_competition_fencers(competition_id)
+    comp_fencer_by_opponent = {
+        row["opponent_id"]: row
+        for row in existing_comp_fencers
+    }
+
+    competition_fencer_adds = 0
+    competition_fencer_updates = 0
+
+    for fencer in imported_fencers:
+        opponent_id = imported_name_to_id[normalize_name(fencer["name"])]
+
+        payload = {
+            "initial_seed": fencer["initial_seed"],
+            "de_seed": fencer["de_seed"],
+            "seed": fencer["de_seed"],
+            "final_place": fencer["final_place"],
+            "final_place_label": (
+                fencer["final_place_label"] or
+                (str(fencer["final_place"]) if fencer["final_place"] else None)
+            ),
+        }
+
+        if opponent_id in comp_fencer_by_opponent:
+            row_id = comp_fencer_by_opponent[opponent_id]["id"]
+
+            supabase.table("competition_fencers").update(
+                payload
+            ).eq(
+                "id",
+                row_id
+            ).execute()
+
+            competition_fencer_updates += 1
+
+        else:
+            supabase.table("competition_fencers").insert({
+                "competition_id": competition_id,
+                "opponent_id": opponent_id,
+                **payload,
+            }).execute()
+
+            competition_fencer_adds += 1
+
+    existing_bouts = get_competition_bouts(competition_id)
+
+    existing_signatures = {
+        canonical_bout_signature(
+            row.get("stage"),
+            row.get("poule_number"),
+            row.get("round_name"),
+            row["fencer_a_id"],
+            row["score_a"],
+            row["fencer_b_id"],
+            row["score_b"],
+        )
+        for row in existing_bouts
+    }
+
+    added_bouts = 0
+    skipped_bouts = 0
+
+    for bout in imported_bouts:
+        a_id = imported_name_to_id.get(normalize_name(bout["fencer_a"]))
+        b_id = imported_name_to_id.get(normalize_name(bout["fencer_b"]))
+
+        if a_id is None or b_id is None:
+            raise ValueError(
+                f"Could not match bout: {bout['fencer_a']} vs {bout['fencer_b']}."
+            )
+
+        if bout["score_a"] is None or bout["score_b"] is None:
+            raise ValueError(
+                f"Missing score for {bout['fencer_a']} vs {bout['fencer_b']}."
+            )
+
+        signature = canonical_bout_signature(
+            bout["stage"],
+            bout["poule_number"],
+            bout["round_name"],
+            a_id,
+            bout["score_a"],
+            b_id,
+            bout["score_b"],
+        )
+
+        if signature in existing_signatures:
+            skipped_bouts += 1
+            continue
+
+        supabase.table("competition_bouts").insert({
+            "competition_id": competition_id,
+            "fencer_a_id": a_id,
+            "fencer_b_id": b_id,
+            "score_a": bout["score_a"],
+            "score_b": bout["score_b"],
+            "stage": bout["stage"],
+            "poule_number": bout["poule_number"],
+            "round_name": bout["round_name"] or None,
+        }).execute()
+
+        existing_signatures.add(signature)
+        added_bouts += 1
+
+    return {
+        "competition_id": competition_id,
+        "competition_created": competition_created,
+        "new_fencers": new_fencer_count,
+        "competition_fencer_adds": competition_fencer_adds,
+        "competition_fencer_updates": competition_fencer_updates,
+        "added_bouts": added_bouts,
+        "skipped_bouts": skipped_bouts,
+    }
 
 
 # ============================================================
@@ -138,9 +576,10 @@ page = st.sidebar.radio(
         "🏠 Dashboard",
         "🤺 Current Session",
         "👤 Opponents",
+        "🏆 Competitions",
         "📚 Session History",
-        "📖 Bout History"
-    ]
+        "📖 Bout History",
+    ],
 )
 
 
@@ -149,92 +588,45 @@ page = st.sidebar.radio(
 # ============================================================
 
 if page == "🏠 Dashboard":
-
     st.header("Your Fencing")
 
     bouts = get_bouts()
     sessions = get_sessions()
 
-    # --------------------------------------------------------
-    # OVERALL STATS
-    # --------------------------------------------------------
-
     total_bouts = len(bouts)
-
-    wins = 0
-    losses = 0
-    draws = 0
-
-    touches_for = 0
-    touches_against = 0
-
-    feeling_total = 0
-    feeling_count = 0
+    wins = losses = draws = 0
+    touches_for = touches_against = 0
+    feeling_total = feeling_count = 0
 
     for bout in bouts:
-
         my_score = bout["my_score"]
-        their_score = bout[
-            "opponent_score"
-        ]
+        their_score = bout["opponent_score"]
 
         touches_for += my_score
-
-        touches_against += (
-            their_score
-        )
+        touches_against += their_score
 
         if my_score > their_score:
-
             wins += 1
-
         elif my_score < their_score:
-
             losses += 1
-
         else:
-
             draws += 1
 
-        if (
-            bout.get("feeling")
-            is not None
-        ):
-
-            feeling_total += (
-                bout["feeling"]
-            )
-
+        if bout.get("feeling") is not None:
+            feeling_total += bout["feeling"]
             feeling_count += 1
 
-    if total_bouts > 0:
-
-        win_rate = (
-            wins
-            / total_bouts
-            * 100
-        )
-
-        average_margin = (
-            touches_for
-            - touches_against
-        ) / total_bouts
-
-    else:
-
-        win_rate = 0
-        average_margin = 0
-
-    if feeling_count > 0:
-
-        average_feeling = (
-            feeling_total
-            / feeling_count
-        )
-
-    else:
-
-        average_feeling = 0
+    win_rate = (wins / total_bouts * 100) if total_bouts else 0
+    average_margin = (
+        (touches_for - touches_against) / total_bouts
+        if total_bouts
+        else 0
+    )
+    average_feeling = (
+        feeling_total / feeling_count
+        if feeling_count
+        else 0
+    )
 
     completed_sessions = [
         session
@@ -242,341 +634,93 @@ if page == "🏠 Dashboard":
         if session.get("ended_at")
     ]
 
-    # --------------------------------------------------------
-    # TOP METRICS
-    # --------------------------------------------------------
-
     col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.metric(
-            "Total bouts",
-            total_bouts
-        )
-
-    with col2:
-
-        st.metric(
-            "Win rate",
-            f"{win_rate:.0f}%"
-        )
+    col1.metric("Total bouts", total_bouts)
+    col2.metric("Win rate", f"{win_rate:.0f}%")
 
     col3, col4 = st.columns(2)
-
-    with col3:
-
-        st.metric(
-            "Record",
-            f"{wins}W – {losses}L"
-        )
-
-    with col4:
-
-        st.metric(
-            "Avg margin",
-            f"{average_margin:+.2f}"
-        )
+    col3.metric("Record", f"{wins}W – {losses}L")
+    col4.metric("Avg margin", f"{average_margin:+.2f}")
 
     col5, col6 = st.columns(2)
-
-    with col5:
-
-        st.metric(
-            "Sessions",
-            len(
-                completed_sessions
-            )
-        )
-
-    with col6:
-
-        st.metric(
-            "Avg fencing",
-            f"{average_feeling:.1f}/10"
-        )
+    col5.metric("Sessions", len(completed_sessions))
+    col6.metric("Avg fencing", f"{average_feeling:.1f}/10")
 
     st.divider()
-
-    # --------------------------------------------------------
-    # RECENT FORM
-    # --------------------------------------------------------
-
     st.subheader("Recent form")
 
     recent_bouts = bouts[:10]
 
-    if not recent_bouts:
+    if recent_bouts:
+        form = ""
+        recent_wins = recent_losses = 0
 
-        st.info(
-            "Log some bouts to "
-            "see your recent form."
-        )
-
-    else:
-
-        result_string = ""
-
-        recent_wins = 0
-        recent_losses = 0
-        recent_draws = 0
-
-        # Reverse so oldest -> newest
-        for bout in reversed(
-            recent_bouts
-        ):
-
-            my_score = (
-                bout["my_score"]
-            )
-
-            their_score = (
-                bout[
-                    "opponent_score"
-                ]
-            )
-
-            if my_score > their_score:
-
-                result_string += "🟢 "
-
+        for bout in reversed(recent_bouts):
+            if bout["my_score"] > bout["opponent_score"]:
+                form += "🟢 "
                 recent_wins += 1
-
-            elif my_score < their_score:
-
-                result_string += "🔴 "
-
+            elif bout["my_score"] < bout["opponent_score"]:
+                form += "🔴 "
                 recent_losses += 1
-
             else:
+                form += "⚪ "
 
-                result_string += "⚪ "
-
-                recent_draws += 1
-
-        st.write(
-            result_string
-        )
-
+        st.write(form)
         st.caption(
-            f"Last "
-            f"{len(recent_bouts)} bouts: "
-            f"{recent_wins}W – "
-            f"{recent_losses}L"
+            f"Last {len(recent_bouts)} bouts: "
+            f"{recent_wins}W – {recent_losses}L"
         )
+    else:
+        st.info("No bouts yet.")
 
     st.divider()
+    st.subheader("Most fenced opponents")
 
-    # --------------------------------------------------------
-    # MOST FENCED OPPONENTS
-    # --------------------------------------------------------
-
-    st.subheader(
-        "Most fenced opponents"
-    )
-
-    opponent_stats = {}
+    stats = {}
 
     for bout in bouts:
-
-        opponent_data = (
-            bout.get("opponents")
-        )
-
-        if not opponent_data:
+        person = bout.get("opponent")
+        if not person:
             continue
 
-        name = (
-            opponent_data["name"]
+        name = person["name"]
+        stats.setdefault(name, {"bouts": 0, "wins": 0, "losses": 0})
+        stats[name]["bouts"] += 1
+
+        if bout["my_score"] > bout["opponent_score"]:
+            stats[name]["wins"] += 1
+        elif bout["my_score"] < bout["opponent_score"]:
+            stats[name]["losses"] += 1
+
+    for name, values in sorted(
+        stats.items(),
+        key=lambda x: x[1]["bouts"],
+        reverse=True,
+    )[:5]:
+        st.write(
+            f"**{name}** — {values['bouts']} bouts • "
+            f"{values['wins']}W–{values['losses']}L"
         )
-
-        if name not in opponent_stats:
-
-            opponent_stats[name] = {
-                "bouts": 0,
-                "wins": 0,
-                "losses": 0,
-                "draws": 0
-            }
-
-        opponent_stats[
-            name
-        ]["bouts"] += 1
-
-        if (
-            bout["my_score"]
-            >
-            bout["opponent_score"]
-        ):
-
-            opponent_stats[
-                name
-            ]["wins"] += 1
-
-        elif (
-            bout["my_score"]
-            <
-            bout["opponent_score"]
-        ):
-
-            opponent_stats[
-                name
-            ]["losses"] += 1
-
-        else:
-
-            opponent_stats[
-                name
-            ]["draws"] += 1
-
-    sorted_opponents = sorted(
-        opponent_stats.items(),
-        key=lambda item:
-            item[1]["bouts"],
-        reverse=True
-    )
-
-    if not sorted_opponents:
-
-        st.info(
-            "No opponent data yet."
-        )
-
-    else:
-
-        for (
-            name,
-            stats
-        ) in sorted_opponents[:5]:
-
-            st.write(
-                f"**{name}** — "
-                f"{stats['bouts']} bouts • "
-                f"{stats['wins']}W–"
-                f"{stats['losses']}L"
-            )
 
     st.divider()
+    st.subheader("Latest bouts")
 
-    # --------------------------------------------------------
-    # LATEST BOUTS
-    # --------------------------------------------------------
+    for bout in bouts[:5]:
+        person = bout.get("opponent")
+        opponent = person["name"] if person else "Unknown"
 
-    st.subheader(
-        "Latest bouts"
-    )
-
-    if not bouts:
-
-        st.info(
-            "No bouts yet."
+        result = get_result_icon(
+            bout["my_score"],
+            bout["opponent_score"],
         )
 
-    else:
-
-        for bout in bouts[:5]:
-
-            opponent_data = (
-                bout.get(
-                    "opponents"
-                )
-            )
-
-            if opponent_data:
-
-                opponent = (
-                    opponent_data[
-                        "name"
-                    ]
-                )
-
-            else:
-
-                opponent = (
-                    "Unknown opponent"
-                )
-
-            my_score = (
-                bout["my_score"]
-            )
-
-            their_score = (
-                bout[
-                    "opponent_score"
-                ]
-            )
-
-            result = (
-                get_result_icon(
-                    my_score,
-                    their_score
-                )
-            )
-
-            st.write(
-                f"**{result} "
-                f"{my_score}–"
-                f"{their_score}** "
-                f"vs {opponent}"
-            )
-
-            if bout.get("notes"):
-
-                st.caption(
-                    bout["notes"]
-                )
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # RECENT SESSIONS
-    # --------------------------------------------------------
-
-    st.subheader(
-        "Recent sessions"
-    )
-
-    if not completed_sessions:
-
-        st.info(
-            "No completed sessions yet."
+        st.write(
+            f"**{result} {bout['my_score']}–{bout['opponent_score']}** "
+            f"vs {opponent}"
         )
 
-    else:
-
-        for session in (
-            completed_sessions[:5]
-        ):
-
-            text = (
-                f"**"
-                f"{session['session_date']}"
-                f"** — "
-                f"{session['session_type']}"
-                f" • "
-                f"{session['weapon']}"
-            )
-
-            if session.get(
-                "location"
-            ):
-
-                text += (
-                    f" • "
-                    f"{session['location']}"
-                )
-
-            st.write(text)
-
-            if session.get(
-                "overall_rating"
-            ):
-
-                st.caption(
-                    f"Session rating: "
-                    f"{session['overall_rating']}"
-                    f"/10"
-                )
+        if bout.get("notes"):
+            st.caption(bout["notes"])
 
 
 # ============================================================
@@ -584,583 +728,250 @@ if page == "🏠 Dashboard":
 # ============================================================
 
 elif page == "🤺 Current Session":
-
-    active_session = (
-        get_active_session()
-    )
-
-    # --------------------------------------------------------
-    # NO ACTIVE SESSION
-    # --------------------------------------------------------
+    active_session = get_active_session()
 
     if active_session is None:
+        st.header("Start fencing")
 
-        st.header(
-            "Start fencing"
-        )
+        with st.form("start_session"):
+            session_date = st.date_input("Date", value=date.today())
 
-        with st.form(
-            "start_session"
-        ):
-
-            session_date = (
-                st.date_input(
-                    "Date",
-                    value=date.today()
-                )
-            )
-
-            session_type = (
-                st.selectbox(
-                    "Session type",
-                    [
-                        "Training",
-                        "Lesson",
-                        "Competition"
-                    ]
-                )
+            session_type = st.selectbox(
+                "Session type",
+                ["Training", "Lesson", "Competition"],
             )
 
             weapon = st.selectbox(
                 "Weapon",
-                [
-                    "Épée",
-                    "Foil",
-                    "Sabre"
-                ]
+                ["Épée", "Foil", "Sabre"],
             )
 
-            location = (
-                st.text_input(
-                    "Location"
-                )
-            )
+            location = st.text_input("Location")
 
-            col1, col2 = (
-                st.columns(2)
-            )
+            col1, col2 = st.columns(2)
 
             with col1:
-
-                energy_before = (
-                    st.slider(
-                        "Energy",
-                        1,
-                        10,
-                        5
-                    )
+                energy_before = st.slider(
+                    "Energy",
+                    1,
+                    10,
+                    5,
                 )
 
             with col2:
-
-                confidence_before = (
-                    st.slider(
-                        "Confidence",
-                        1,
-                        10,
-                        5
-                    )
+                confidence_before = st.slider(
+                    "Confidence",
+                    1,
+                    10,
+                    5,
                 )
 
-            start_session = (
-                st.form_submit_button(
-                    "🤺 START SESSION",
-                    type="primary",
-                    use_container_width=True
-                )
+            start_session = st.form_submit_button(
+                "🤺 START SESSION",
+                type="primary",
+                use_container_width=True,
             )
 
         if start_session:
-
-            supabase.table(
-                "sessions"
-            ).insert({
-
-                "session_date":
-                    str(session_date),
-
-                "session_type":
-                    session_type,
-
-                "weapon":
-                    weapon,
-
-                "location":
-                    location.strip(),
-
-                "energy_before":
-                    energy_before,
-
-                "confidence_before":
-                    confidence_before
-
+            supabase.table("sessions").insert({
+                "session_date": str(session_date),
+                "session_type": session_type,
+                "weapon": weapon,
+                "location": location.strip(),
+                "energy_before": energy_before,
+                "confidence_before": confidence_before,
             }).execute()
 
             st.rerun()
 
-    # --------------------------------------------------------
-    # ACTIVE SESSION
-    # --------------------------------------------------------
-
     else:
-
         st.caption(
-            f"{active_session['session_type']}"
-            f" • "
-            f"{active_session['weapon']}"
-            f" • "
+            f"{active_session['session_type']} • "
+            f"{active_session['weapon']} • "
             f"{active_session['session_date']}"
         )
 
-        if active_session.get(
-            "location"
-        ):
-
-            st.caption(
-                f"📍 "
-                f"{active_session['location']}"
-            )
-
-        # ----------------------------------------------------
-        # GET SESSION BOUTS
-        # ----------------------------------------------------
+        if active_session.get("location"):
+            st.caption(f"📍 {active_session['location']}")
 
         session_bouts = (
             supabase
             .table("bouts")
-            .select(
-                "*, opponents(name)"
-            )
-            .eq(
-                "session_id",
-                active_session["id"]
-            )
+            .select("*")
+            .eq("session_id", active_session["id"])
             .order("created_at")
             .execute()
             .data
         )
 
-        wins = 0
-        losses = 0
-        draws = 0
+        people = opponent_map()
 
-        touches_for = 0
-        touches_against = 0
+        wins = losses = 0
+        touches_for = touches_against = 0
 
         for bout in session_bouts:
+            touches_for += bout["my_score"]
+            touches_against += bout["opponent_score"]
 
-            my_score = (
-                bout["my_score"]
-            )
-
-            their_score = (
-                bout[
-                    "opponent_score"
-                ]
-            )
-
-            touches_for += (
-                my_score
-            )
-
-            touches_against += (
-                their_score
-            )
-
-            if (
-                my_score
-                >
-                their_score
-            ):
-
+            if bout["my_score"] > bout["opponent_score"]:
                 wins += 1
-
-            elif (
-                my_score
-                <
-                their_score
-            ):
-
+            elif bout["my_score"] < bout["opponent_score"]:
                 losses += 1
 
-            else:
+        st.subheader("Current session")
 
-                draws += 1
-
-        # ----------------------------------------------------
-        # SESSION SCOREBOARD
-        # ----------------------------------------------------
-
-        st.subheader(
-            "Current session"
-        )
-
-        col1, col2, col3 = (
-            st.columns(3)
-        )
-
-        with col1:
-
-            st.metric(
-                "Bouts",
-                len(
-                    session_bouts
-                )
-            )
-
-        with col2:
-
-            st.metric(
-                "Record",
-                f"{wins}–{losses}"
-            )
-
-        with col3:
-
-            indicator = (
-                touches_for
-                - touches_against
-            )
-
-            st.metric(
-                "Indicator",
-                f"{indicator:+d}"
-            )
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Bouts", len(session_bouts))
+        col2.metric("Record", f"{wins}–{losses}")
+        col3.metric("Indicator", f"{touches_for - touches_against:+d}")
 
         st.divider()
+        st.header("⚡ Log Bout")
 
-        # ----------------------------------------------------
-        # QUICK BOUT LOGGER
-        # ----------------------------------------------------
-
-        st.header(
-            "⚡ Log Bout"
-        )
-
-        opponents = (
-            get_opponents()
-        )
+        opponents = get_opponents()
 
         if not opponents:
-
-            st.warning(
-                "Add an opponent first."
-            )
-
+            st.warning("Add an opponent first.")
         else:
-
             opponent_lookup = {
-                person["name"]:
-                    person["id"]
-
-                for person
-                in opponents
+                person["name"]: person["id"]
+                for person in opponents
             }
 
             with st.form(
                 "quick_bout",
-                clear_on_submit=True
+                clear_on_submit=True,
             ):
-
-                opponent_name = (
-                    st.selectbox(
-                        "Opponent",
-                        list(
-                            opponent_lookup.keys()
-                        )
-                    )
+                opponent_name = st.selectbox(
+                    "Opponent",
+                    list(opponent_lookup.keys()),
                 )
 
-                left, middle, right = (
-                    st.columns(
-                        [4, 1, 4]
-                    )
-                )
+                left, middle, right = st.columns([4, 1, 4])
 
                 with left:
-
-                    my_score = (
-                        st.number_input(
-                            "You",
-                            min_value=0,
-                            max_value=50,
-                            value=5,
-                            step=1
-                        )
+                    my_score = st.number_input(
+                        "You",
+                        min_value=0,
+                        max_value=50,
+                        value=5,
+                        step=1,
                     )
 
                 with middle:
-
                     st.markdown(
-                        "<h2 "
-                        "style='text-align:center;"
-                        "padding-top:22px;'>"
-                        "–"
-                        "</h2>",
-                        unsafe_allow_html=True
+                        "<h2 style='text-align:center;padding-top:22px;'>–</h2>",
+                        unsafe_allow_html=True,
                     )
 
                 with right:
-
-                    opponent_score = (
-                        st.number_input(
-                            "Them",
-                            min_value=0,
-                            max_value=50,
-                            value=3,
-                            step=1
-                        )
+                    opponent_score = st.number_input(
+                        "Them",
+                        min_value=0,
+                        max_value=50,
+                        value=3,
+                        step=1,
                     )
 
-                feeling = (
-                    st.slider(
-                        "How well did you fence?",
-                        1,
-                        10,
-                        5
-                    )
+                feeling = st.slider(
+                    "How well did you fence?",
+                    1,
+                    10,
+                    5,
                 )
 
-                quick_note = (
-                    st.text_area(
-                        "Quick note",
-                        placeholder=(
-                            "e.g. Distance good. "
-                            "Disengage worked."
-                        ),
-                        height=80
-                    )
+                quick_note = st.text_area(
+                    "Quick note",
+                    placeholder="Distance good, disengage worked...",
+                    height=80,
                 )
 
-                with st.expander(
-                    "Detailed notes"
-                ):
+                with st.expander("Detailed notes"):
+                    what_worked = st.text_area("What worked?")
+                    what_didnt = st.text_area("What didn't work?")
 
-                    what_worked = (
-                        st.text_area(
-                            "What worked?"
-                        )
-                    )
-
-                    what_didnt = (
-                        st.text_area(
-                            "What didn't work?"
-                        )
-                    )
-
-                save_bout = (
-                    st.form_submit_button(
-                        "SAVE + NEXT BOUT",
-                        type="primary",
-                        use_container_width=True
-                    )
+                save_bout = st.form_submit_button(
+                    "SAVE + NEXT BOUT",
+                    type="primary",
+                    use_container_width=True,
                 )
 
             if save_bout:
-
-                supabase.table(
-                    "bouts"
-                ).insert({
-
-                    "session_id":
-                        active_session[
-                            "id"
-                        ],
-
-                    "opponent_id":
-                        opponent_lookup[
-                            opponent_name
-                        ],
-
-                    "my_score":
-                        int(
-                            my_score
-                        ),
-
-                    "opponent_score":
-                        int(
-                            opponent_score
-                        ),
-
-                    "feeling":
-                        int(
-                            feeling
-                        ),
-
-                    "what_worked":
-                        what_worked,
-
-                    "what_didnt":
-                        what_didnt,
-
-                    "notes":
-                        quick_note
-
+                supabase.table("bouts").insert({
+                    "session_id": active_session["id"],
+                    "opponent_id": opponent_lookup[opponent_name],
+                    "my_score": int(my_score),
+                    "opponent_score": int(opponent_score),
+                    "feeling": int(feeling),
+                    "what_worked": what_worked,
+                    "what_didnt": what_didnt,
+                    "notes": quick_note,
                 }).execute()
 
                 st.toast(
-                    f"Saved "
-                    f"{my_score}–"
-                    f"{opponent_score} "
-                    f"vs "
-                    f"{opponent_name}",
-                    icon="🤺"
+                    f"Saved {my_score}–{opponent_score} vs {opponent_name}",
+                    icon="🤺",
                 )
 
                 st.rerun()
 
-        # ----------------------------------------------------
-        # SESSION BOUT LIST
-        # ----------------------------------------------------
-
         if session_bouts:
-
             st.divider()
+            st.subheader("This session")
 
-            st.subheader(
-                "This session"
-            )
+            for bout in reversed(session_bouts):
+                person = people.get(bout["opponent_id"])
+                opponent = person["name"] if person else "Unknown"
 
-            for bout in reversed(
-                session_bouts
-            ):
-
-                opponent_data = (
-                    bout.get(
-                        "opponents"
-                    )
-                )
-
-                if opponent_data:
-
-                    opponent = (
-                        opponent_data[
-                            "name"
-                        ]
-                    )
-
-                else:
-
-                    opponent = (
-                        "Unknown"
-                    )
-
-                my_score = (
-                    bout["my_score"]
-                )
-
-                their_score = (
-                    bout[
-                        "opponent_score"
-                    ]
-                )
-
-                result = (
-                    get_result_icon(
-                        my_score,
-                        their_score
-                    )
+                result = get_result_icon(
+                    bout["my_score"],
+                    bout["opponent_score"],
                 )
 
                 st.write(
-                    f"**{result} "
-                    f"{my_score}–"
-                    f"{their_score}** "
-                    f"vs "
-                    f"{opponent}"
+                    f"**{result} {bout['my_score']}–{bout['opponent_score']}** "
+                    f"vs {opponent}"
                 )
 
-                if bout.get(
-                    "notes"
-                ):
-
-                    st.caption(
-                        bout[
-                            "notes"
-                        ]
-                    )
-
-        # ----------------------------------------------------
-        # END SESSION
-        # ----------------------------------------------------
+                if bout.get("notes"):
+                    st.caption(bout["notes"])
 
         st.divider()
 
-        with st.expander(
-            "🏁 Finish session"
-        ):
-
-            with st.form(
-                "finish_session"
-            ):
-
-                overall_rating = (
-                    st.slider(
-                        "Overall session",
-                        1,
-                        10,
-                        5
-                    )
+        with st.expander("🏁 Finish session"):
+            with st.form("finish_session"):
+                overall_rating = st.slider(
+                    "Overall session",
+                    1,
+                    10,
+                    5,
                 )
 
-                what_i_learned = (
-                    st.text_area(
-                        "What did you learn?"
-                    )
+                what_i_learned = st.text_area("What did you learn?")
+                what_to_work_on = st.text_area("What should you work on?")
+                session_notes = st.text_area(
+                    "General session diary",
+                    height=120,
                 )
 
-                what_to_work_on = (
-                    st.text_area(
-                        "What should you work on?"
-                    )
-                )
-
-                session_notes = (
-                    st.text_area(
-                        "General session diary",
-                        height=120
-                    )
-                )
-
-                end_session = (
-                    st.form_submit_button(
-                        "END SESSION",
-                        use_container_width=True
-                    )
+                end_session = st.form_submit_button(
+                    "END SESSION",
+                    use_container_width=True,
                 )
 
             if end_session:
-
-                supabase.table(
-                    "sessions"
-                ).update({
-
-                    "overall_rating":
-                        overall_rating,
-
-                    "what_i_learned":
-                        what_i_learned,
-
-                    "what_to_work_on":
-                        what_to_work_on,
-
-                    "session_notes":
-                        session_notes,
-
-                    "ended_at":
-                        datetime.now(
-                            timezone.utc
-                        ).isoformat()
-
+                supabase.table("sessions").update({
+                    "overall_rating": overall_rating,
+                    "what_i_learned": what_i_learned,
+                    "what_to_work_on": what_to_work_on,
+                    "session_notes": session_notes,
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
                 }).eq(
                     "id",
-                    active_session["id"]
+                    active_session["id"],
                 ).execute()
 
-                st.success(
-                    "Session saved!"
-                )
-
+                st.success("Session saved!")
                 st.rerun()
 
 
@@ -1169,435 +980,946 @@ elif page == "🤺 Current Session":
 # ============================================================
 
 elif page == "👤 Opponents":
+    st.header("Opponents")
 
-    st.header(
-        "Opponents"
-    )
-
-    # --------------------------------------------------------
-    # ADD OPPONENT
-    # --------------------------------------------------------
-
-    with st.expander(
-        "➕ Add opponent"
-    ):
-
+    with st.expander("➕ Add opponent"):
         with st.form(
             "add_opponent",
-            clear_on_submit=True
+            clear_on_submit=True,
         ):
+            name = st.text_input("Name")
+            club = st.text_input("Club")
+            region = st.text_input("Region / state")
 
-            name = (
-                st.text_input(
-                    "Name"
-                )
+            handedness = st.selectbox(
+                "Handedness",
+                ["Unknown", "Right", "Left"],
             )
 
-            club = (
-                st.text_input(
-                    "Club"
-                )
+            weapon = st.selectbox(
+                "Weapon",
+                ["Épée", "Foil", "Sabre"],
             )
 
-            handedness = (
-                st.selectbox(
-                    "Handedness",
-                    [
-                        "Unknown",
-                        "Right",
-                        "Left"
-                    ]
-                )
-            )
+            notes = st.text_area("Opponent notes")
 
-            weapon = (
-                st.selectbox(
-                    "Weapon",
-                    [
-                        "Épée",
-                        "Foil",
-                        "Sabre"
-                    ]
-                )
-            )
-
-            notes = (
-                st.text_area(
-                    "Opponent notes"
-                )
-            )
-
-            add_opponent = (
-                st.form_submit_button(
-                    "Add opponent",
-                    type="primary",
-                    use_container_width=True
-                )
+            add_opponent = st.form_submit_button(
+                "Add opponent",
+                type="primary",
+                use_container_width=True,
             )
 
         if add_opponent:
-
             if not name.strip():
-
-                st.error(
-                    "Enter a name."
-                )
-
+                st.error("Enter a name.")
             else:
-
                 try:
-
-                    supabase.table(
-                        "opponents"
-                    ).insert({
-
-                        "name":
-                            name.strip(),
-
-                        "club":
-                            club.strip(),
-
-                        "handedness":
-                            handedness,
-
-                        "weapon":
-                            weapon,
-
-                        "notes":
-                            notes
-
+                    supabase.table("opponents").insert({
+                        "name": name.strip(),
+                        "club": club.strip() or None,
+                        "region": region.strip() or None,
+                        "handedness": handedness,
+                        "weapon": weapon,
+                        "notes": notes,
                     }).execute()
 
-                    st.success(
-                        f"{name.strip()} "
-                        f"added!"
-                    )
-
+                    st.success(f"{name.strip()} added!")
                     st.rerun()
 
                 except Exception as e:
+                    st.error(f"Couldn't add opponent: {e}")
 
-                    st.error(
-                        f"Couldn't add "
-                        f"opponent: "
-                        f"{e}"
-                    )
-
-    # --------------------------------------------------------
-    # VIEW OPPONENT
-    # --------------------------------------------------------
-
-    opponents = (
-        get_opponents()
-    )
+    opponents = get_opponents()
 
     if not opponents:
-
-        st.info(
-            "No opponents yet."
-        )
-
+        st.info("No opponents yet.")
     else:
-
         opponent_names = [
             person["name"]
-            for person
-            in opponents
+            for person in opponents
         ]
 
-        selected_name = (
-            st.selectbox(
-                "View opponent",
-                opponent_names
-            )
+        selected_name = st.selectbox(
+            "View opponent",
+            opponent_names,
         )
 
         selected = next(
             person
-            for person
-            in opponents
-            if (
-                person["name"]
-                ==
-                selected_name
-            )
+            for person in opponents
+            if person["name"] == selected_name
         )
 
         st.divider()
+        st.header(selected["name"])
 
-        st.header(
-            selected[
-                "name"
-            ]
-        )
-
-        details = []
-
-        if selected.get(
-            "club"
-        ):
-
-            details.append(
-                selected[
-                    "club"
-                ]
-            )
-
-        if selected.get(
-            "handedness"
-        ):
-
-            details.append(
-                selected[
-                    "handedness"
-                ]
-            )
-
-        if selected.get(
-            "weapon"
-        ):
-
-            details.append(
-                selected[
-                    "weapon"
-                ]
-            )
+        details = [
+            clean_text(selected.get("club")),
+            clean_text(selected.get("region")),
+            clean_text(selected.get("handedness")),
+            clean_text(selected.get("weapon")),
+        ]
+        details = [x for x in details if x]
 
         if details:
+            st.caption(" • ".join(details))
 
-            st.caption(
-                " • ".join(
-                    details
-                )
-            )
-
-        if selected.get(
-            "notes"
-        ):
-
-            st.write(
-                "**Opponent notes**"
-            )
-
-            st.write(
-                selected[
-                    "notes"
-                ]
-            )
-
-        # ----------------------------------------------------
-        # HEAD-TO-HEAD
-        # ----------------------------------------------------
+        if selected.get("notes"):
+            st.write("**Opponent notes**")
+            st.write(selected["notes"])
 
         opponent_bouts = (
             supabase
             .table("bouts")
             .select("*")
-            .eq(
-                "opponent_id",
-                selected[
-                    "id"
-                ]
-            )
-            .order(
-                "created_at",
-                desc=True
-            )
+            .eq("opponent_id", selected["id"])
+            .order("created_at", desc=True)
             .execute()
             .data
         )
 
-        st.subheader(
-            "Head-to-head"
-        )
+        st.subheader("Head-to-head")
 
-        if not opponent_bouts:
-
-            st.info(
-                "No bouts recorded "
-                "against this opponent."
-            )
-
-        else:
-
-            wins = 0
-            losses = 0
-            draws = 0
-
+        if opponent_bouts:
+            wins = losses = 0
             total_margin = 0
 
-            for bout in (
-                opponent_bouts
-            ):
-
+            for bout in opponent_bouts:
                 margin = (
-                    bout[
-                        "my_score"
-                    ]
-                    -
-                    bout[
-                        "opponent_score"
-                    ]
+                    bout["my_score"]
+                    - bout["opponent_score"]
                 )
-
-                total_margin += (
-                    margin
-                )
+                total_margin += margin
 
                 if margin > 0:
-
                     wins += 1
-
                 elif margin < 0:
-
                     losses += 1
 
-                else:
+            bout_count = len(opponent_bouts)
+            win_rate = wins / bout_count * 100
+            avg_margin = total_margin / bout_count
 
-                    draws += 1
+            col1, col2 = st.columns(2)
+            col1.metric("Record", f"{wins}W – {losses}L")
+            col2.metric("Win rate", f"{win_rate:.0f}%")
 
-            bout_count = len(
-                opponent_bouts
-            )
+            col3, col4 = st.columns(2)
+            col3.metric("Avg margin", f"{avg_margin:+.2f}")
+            col4.metric("Total bouts", bout_count)
 
-            average_margin = (
-                total_margin
-                / bout_count
-            )
+            st.subheader("Recent bouts")
 
-            win_rate = (
-                wins
-                / bout_count
-                * 100
-            )
-
-            col1, col2 = (
-                st.columns(2)
-            )
-
-            with col1:
-
-                st.metric(
-                    "Record",
-                    f"{wins}W – "
-                    f"{losses}L"
-                )
-
-            with col2:
-
-                st.metric(
-                    "Win rate",
-                    f"{win_rate:.0f}%"
-                )
-
-            col3, col4 = (
-                st.columns(2)
-            )
-
-            with col3:
-
-                st.metric(
-                    "Avg margin",
-                    f"{average_margin:+.2f}"
-                )
-
-            with col4:
-
-                st.metric(
-                    "Total bouts",
-                    bout_count
-                )
-
-            # -----------------------------------------------
-            # LAST 5
-            # -----------------------------------------------
-
-            st.subheader(
-                "Last 5"
-            )
-
-            last_five = (
-                opponent_bouts[:5]
-            )
-
-            form = ""
-
-            for bout in reversed(
-                last_five
-            ):
-
-                if (
-                    bout["my_score"]
-                    >
-                    bout[
-                        "opponent_score"
-                    ]
-                ):
-
-                    form += "🟢 "
-
-                elif (
-                    bout["my_score"]
-                    <
-                    bout[
-                        "opponent_score"
-                    ]
-                ):
-
-                    form += "🔴 "
-
-                else:
-
-                    form += "⚪ "
-
-            st.write(form)
-
-            # -----------------------------------------------
-            # RECENT BOUTS
-            # -----------------------------------------------
-
-            st.subheader(
-                "Recent bouts"
-            )
-
-            for bout in (
-                opponent_bouts[:10]
-            ):
-
-                my_score = (
-                    bout[
-                        "my_score"
-                    ]
-                )
-
-                their_score = (
-                    bout[
-                        "opponent_score"
-                    ]
-                )
-
-                result = (
-                    get_result_icon(
-                        my_score,
-                        their_score
-                    )
+            for bout in opponent_bouts[:10]:
+                result = get_result_icon(
+                    bout["my_score"],
+                    bout["opponent_score"],
                 )
 
                 st.write(
-                    f"**{result} "
-                    f"{my_score}–"
-                    f"{their_score}**"
+                    f"**{result} {bout['my_score']}–{bout['opponent_score']}**"
                 )
 
-                if bout.get(
-                    "notes"
-                ):
+                if bout.get("notes"):
+                    st.caption(bout["notes"])
+        else:
+            st.info("No bouts against this opponent yet.")
 
-                    st.caption(
-                        bout[
-                            "notes"
-                        ]
+
+# ============================================================
+# COMPETITIONS
+# ============================================================
+
+elif page == "🏆 Competitions":
+    st.header("Competitions")
+
+    import_tab, manage_tab = st.tabs(
+        ["📥 Import results", "🏆 Manage competitions"]
+    )
+
+    # --------------------------------------------------------
+    # IMPORT TAB
+    # --------------------------------------------------------
+
+    with import_tab:
+        st.subheader("Import competition results")
+
+        st.caption(
+            "Upload a CSV in the Fencing Diary import format. "
+            "The importer will match existing fencers, create new ones, "
+            "add seeds/final placings, and import poule and DE bouts."
+        )
+
+        uploaded_file = st.file_uploader(
+            "Competition CSV",
+            type=["csv"],
+            key="competition_import_file",
+        )
+
+        if uploaded_file is not None:
+            try:
+                import_df = pd.read_csv(uploaded_file)
+            except Exception as e:
+                st.error(f"Could not read CSV: {e}")
+                import_df = None
+
+            if import_df is not None:
+                errors = validate_import(import_df)
+
+                if errors:
+                    for error in errors:
+                        st.error(error)
+                else:
+                    comp, imported_fencers, imported_bouts = parse_import(import_df)
+
+                    st.success("Import file recognised.")
+
+                    title = comp["name"]
+
+                    if comp.get("event_name"):
+                        title += f" — {comp['event_name']}"
+
+                    st.markdown(f"### {title}")
+                    st.write(
+                        f"**Date:** {comp['competition_date']}  \n"
+                        f"**Weapon:** {comp['weapon']}  \n"
+                        f"**Location:** {comp['location'] or '—'}  \n"
+                        f"**Field size:** {comp['field_size'] or len(imported_fencers)}"
                     )
+
+                    poule_count = sum(
+                        1
+                        for bout in imported_bouts
+                        if normalize_name(bout["stage"]) == "poule"
+                    )
+
+                    de_count = sum(
+                        1
+                        for bout in imported_bouts
+                        if normalize_name(bout["stage"]) == "de"
+                    )
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Fencers", len(imported_fencers))
+                    col2.metric("Poule bouts", poule_count)
+                    col3.metric("DE bouts", de_count)
+
+                    existing_comp = find_existing_competition(comp)
+
+                    if existing_comp:
+                        st.info(
+                            "This competition already exists. "
+                            "Importing again will update fencer results and "
+                            "skip competition bouts already stored."
+                        )
+
+                    st.divider()
+                    st.subheader("Fencer matching")
+
+                    existing_opponents = get_opponents()
+                    existing_names = [
+                        row["name"]
+                        for row in existing_opponents
+                    ]
+
+                    name_choices = {}
+                    unmatched_count = 0
+
+                    for i, fencer in enumerate(imported_fencers):
+                        exact = find_exact_opponent(
+                            fencer,
+                            existing_opponents,
+                        )
+
+                        if exact:
+                            st.write(
+                                f"✅ **{fencer['name']}** → {exact['name']}"
+                            )
+                        else:
+                            unmatched_count += 1
+
+                            choice = st.selectbox(
+                                f"{fencer['name']} "
+                                f"({fencer['club'] or 'No club'})",
+                                ["➕ Create new fencer"] + existing_names,
+                                key=f"import_match_{i}",
+                            )
+
+                            name_choices[i] = choice
+
+                    if unmatched_count:
+                        st.caption(
+                            f"{unmatched_count} imported fencer(s) need a decision. "
+                            "Leave them on 'Create new fencer' unless an existing "
+                            "profile is the same person."
+                        )
+                    else:
+                        st.caption(
+                            "All imported fencers matched existing profiles."
+                        )
+
+                    st.divider()
+
+                    with st.expander("Preview fencers"):
+                        preview_fencers = pd.DataFrame(imported_fencers)
+                        st.dataframe(
+                            preview_fencers[
+                                [
+                                    "name",
+                                    "club",
+                                    "region",
+                                    "initial_seed",
+                                    "de_seed",
+                                    "final_place_label",
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    with st.expander("Preview bouts"):
+                        preview_bouts = pd.DataFrame(imported_bouts)
+                        st.dataframe(
+                            preview_bouts,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    if st.button(
+                        "IMPORT COMPETITION",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            result = import_competition_data(
+                                comp,
+                                imported_fencers,
+                                imported_bouts,
+                                name_choices,
+                            )
+
+                            st.success(
+                                "Competition imported successfully."
+                            )
+
+                            if result["competition_created"]:
+                                st.write("✅ Competition created")
+                            else:
+                                st.write("✅ Existing competition updated")
+
+                            st.write(
+                                f"✅ {result['new_fencers']} new fencer profile(s) created"
+                            )
+                            st.write(
+                                f"✅ {result['competition_fencer_adds']} fencer(s) "
+                                f"added to the competition"
+                            )
+                            st.write(
+                                f"✅ {result['competition_fencer_updates']} competition "
+                                f"fencer record(s) updated"
+                            )
+                            st.write(
+                                f"✅ {result['added_bouts']} new bout(s) imported"
+                            )
+
+                            if result["skipped_bouts"]:
+                                st.write(
+                                    f"↪️ {result['skipped_bouts']} duplicate bout(s) skipped"
+                                )
+
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(f"Import failed: {e}")
+
+    # --------------------------------------------------------
+    # MANAGE TAB
+    # --------------------------------------------------------
+
+    with manage_tab:
+        with st.expander("➕ Create competition manually"):
+            with st.form(
+                "create_competition",
+                clear_on_submit=True,
+            ):
+                competition_name = st.text_input(
+                    "Competition name"
+                )
+
+                event_name = st.text_input(
+                    "Event name",
+                    placeholder="e.g. Open/Veteran Men's Epee",
+                )
+
+                competition_date = st.date_input(
+                    "Competition date",
+                    value=date.today(),
+                )
+
+                weapon = st.selectbox(
+                    "Weapon",
+                    ["Épée", "Foil", "Sabre"],
+                    key="manual_comp_weapon",
+                )
+
+                location = st.text_input("Location")
+
+                level = st.selectbox(
+                    "Level",
+                    [
+                        "",
+                        "Club",
+                        "State",
+                        "National",
+                        "International",
+                    ],
+                )
+
+                field_size = st.number_input(
+                    "Field size",
+                    min_value=1,
+                    value=20,
+                    step=1,
+                )
+
+                create = st.form_submit_button(
+                    "Create competition",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if create:
+                if not competition_name.strip():
+                    st.error("Enter a competition name.")
+                else:
+                    supabase.table("competitions").insert({
+                        "name": competition_name.strip(),
+                        "event_name": event_name.strip() or None,
+                        "competition_date": str(competition_date),
+                        "weapon": weapon,
+                        "location": location.strip() or None,
+                        "level": level or None,
+                        "field_size": int(field_size),
+                    }).execute()
+
+                    st.success("Competition created!")
+                    st.rerun()
+
+        competitions = get_competitions()
+
+        if not competitions:
+            st.info("No competitions yet.")
+        else:
+            competition_lookup = {}
+
+            for competition in competitions:
+                label = (
+                    f"{competition['competition_date']} • "
+                    f"{competition['name']}"
+                )
+
+                if competition.get("event_name"):
+                    label += f" • {competition['event_name']}"
+
+                competition_lookup[label] = competition
+
+            selected_label = st.selectbox(
+                "Select competition",
+                list(competition_lookup.keys()),
+            )
+
+            competition = competition_lookup[selected_label]
+            competition_id = competition["id"]
+
+            st.divider()
+
+            st.header(competition["name"])
+
+            if competition.get("event_name"):
+                st.subheader(competition["event_name"])
+
+            details = [
+                clean_text(competition.get("competition_date")),
+                clean_text(competition.get("weapon")),
+                clean_text(competition.get("level")),
+                clean_text(competition.get("location")),
+            ]
+            details = [x for x in details if x]
+
+            if details:
+                st.caption(" • ".join(details))
+
+            competition_fencers = get_competition_fencers(
+                competition_id
+            )
+
+            competition_bouts = get_competition_bouts(
+                competition_id
+            )
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Fencers", len(competition_fencers))
+            col2.metric(
+                "Poule bouts",
+                sum(
+                    1
+                    for b in competition_bouts
+                    if normalize_name(b.get("stage")) == "poule"
+                ),
+            )
+            col3.metric(
+                "DE bouts",
+                sum(
+                    1
+                    for b in competition_bouts
+                    if normalize_name(b.get("stage")) == "de"
+                ),
+            )
+
+            # ------------------------------------------------
+            # MANUAL FENCER MANAGEMENT
+            # ------------------------------------------------
+
+            with st.expander("➕ Add fencer / edit placing"):
+                current_ids = {
+                    row["opponent_id"]
+                    for row in competition_fencers
+                }
+
+                all_opponents = get_opponents()
+
+                available = [
+                    person
+                    for person in all_opponents
+                    if person["id"] not in current_ids
+                ]
+
+                st.markdown("**Add existing fencer**")
+
+                if available:
+                    available_lookup = {
+                        person["name"]: person["id"]
+                        for person in available
+                    }
+
+                    existing_name = st.selectbox(
+                        "Existing fencer",
+                        list(available_lookup.keys()),
+                        key="manual_add_existing_comp_fencer",
+                    )
+
+                    if st.button(
+                        "Add existing fencer",
+                        key="manual_add_existing_comp_fencer_button",
+                    ):
+                        supabase.table("competition_fencers").insert({
+                            "competition_id": competition_id,
+                            "opponent_id": available_lookup[existing_name],
+                        }).execute()
+
+                        st.success(f"{existing_name} added.")
+                        st.rerun()
+                else:
+                    st.caption("All existing fencers are already in this competition.")
+
+                st.markdown("**Create new fencer**")
+
+                with st.form(
+                    "manual_new_comp_fencer",
+                    clear_on_submit=True,
+                ):
+                    new_name = st.text_input("Name")
+                    new_club = st.text_input("Club")
+                    new_region = st.text_input("Region / state")
+
+                    create_and_add = st.form_submit_button(
+                        "Create + add to competition"
+                    )
+
+                if create_and_add:
+                    if not new_name.strip():
+                        st.error("Enter a name.")
+                    else:
+                        result = (
+                            supabase
+                            .table("opponents")
+                            .insert({
+                                "name": new_name.strip(),
+                                "club": new_club.strip() or None,
+                                "region": new_region.strip() or None,
+                                "handedness": "Unknown",
+                                "weapon": competition["weapon"],
+                            })
+                            .execute()
+                        )
+
+                        new_id = result.data[0]["id"]
+
+                        supabase.table("competition_fencers").insert({
+                            "competition_id": competition_id,
+                            "opponent_id": new_id,
+                        }).execute()
+
+                        st.success(f"{new_name.strip()} created and added.")
+                        st.rerun()
+
+                competition_fencers = get_competition_fencers(
+                    competition_id
+                )
+
+                if competition_fencers:
+                    st.divider()
+                    st.markdown("**Edit seeds / final placing**")
+
+                    editable_lookup = {
+                        row["person"]["name"]: row
+                        for row in competition_fencers
+                        if row.get("person")
+                    }
+
+                    edit_name = st.selectbox(
+                        "Fencer to edit",
+                        list(editable_lookup.keys()),
+                        key="edit_comp_fencer_result",
+                    )
+
+                    edit_row = editable_lookup[edit_name]
+
+                    with st.form("edit_comp_fencer_form"):
+                        initial_seed = st.number_input(
+                            "Initial seed",
+                            min_value=0,
+                            value=int(edit_row.get("initial_seed") or 0),
+                            step=1,
+                        )
+
+                        de_seed = st.number_input(
+                            "DE seed",
+                            min_value=0,
+                            value=int(edit_row.get("de_seed") or edit_row.get("seed") or 0),
+                            step=1,
+                        )
+
+                        final_place = st.number_input(
+                            "Final place",
+                            min_value=0,
+                            value=int(edit_row.get("final_place") or 0),
+                            step=1,
+                        )
+
+                        final_place_label = st.text_input(
+                            "Final place label",
+                            value=clean_text(edit_row.get("final_place_label")),
+                            placeholder="e.g. 3T",
+                        )
+
+                        save_fencer_result = st.form_submit_button(
+                            "Save fencer result"
+                        )
+
+                    if save_fencer_result:
+                        supabase.table("competition_fencers").update({
+                            "initial_seed": int(initial_seed) if initial_seed else None,
+                            "de_seed": int(de_seed) if de_seed else None,
+                            "seed": int(de_seed) if de_seed else None,
+                            "final_place": int(final_place) if final_place else None,
+                            "final_place_label": (
+                                final_place_label.strip()
+                                if final_place_label.strip()
+                                else (
+                                    str(int(final_place))
+                                    if final_place
+                                    else None
+                                )
+                            ),
+                        }).eq(
+                            "id",
+                            edit_row["id"],
+                        ).execute()
+
+                        st.success("Fencer result updated.")
+                        st.rerun()
+
+            competition_fencers = get_competition_fencers(
+                competition_id
+            )
+
+            st.divider()
+            st.subheader("Fencers")
+
+            ranked_rows = sorted(
+                competition_fencers,
+                key=lambda row: (
+                    row.get("final_place")
+                    if row.get("final_place") is not None
+                    else 999999,
+                    row.get("de_seed")
+                    if row.get("de_seed") is not None
+                    else 999999,
+                ),
+            )
+
+            for row in ranked_rows:
+                person = row.get("person")
+                if not person:
+                    continue
+
+                pieces = [f"**{person['name']}**"]
+
+                if row.get("initial_seed"):
+                    pieces.append(f"Initial seed {row['initial_seed']}")
+
+                if row.get("de_seed"):
+                    pieces.append(f"DE seed {row['de_seed']}")
+
+                if row.get("final_place_label"):
+                    pieces.append(f"Final {row['final_place_label']}")
+                elif row.get("final_place"):
+                    pieces.append(f"Final {row['final_place']}")
+
+                st.write(" • ".join(pieces))
+
+            st.divider()
+            st.subheader("Poule results")
+
+            poule_bouts = [
+                b
+                for b in competition_bouts
+                if normalize_name(b.get("stage")) == "poule"
+            ]
+
+            poules = {}
+
+            for bout in poule_bouts:
+                number = bout.get("poule_number") or 0
+                poules.setdefault(number, []).append(bout)
+
+            if not poules:
+                st.caption("No poule bouts entered.")
+            else:
+                for poule_number in sorted(poules):
+                    st.markdown(f"**Poule {poule_number}**")
+
+                    for bout in poules[poule_number]:
+                        a = bout.get("fencer_a")
+                        b = bout.get("fencer_b")
+
+                        a_name = a["name"] if a else "Unknown"
+                        b_name = b["name"] if b else "Unknown"
+
+                        st.write(
+                            f"{a_name} "
+                            f"**{bout['score_a']}–{bout['score_b']}** "
+                            f"{b_name}"
+                        )
+
+            st.divider()
+            st.subheader("Direct elimination")
+
+            de_bouts = [
+                b
+                for b in competition_bouts
+                if normalize_name(b.get("stage")) == "de"
+            ]
+
+            round_order = [
+                "T512",
+                "T256",
+                "T128",
+                "T64",
+                "T32",
+                "T16",
+                "T8",
+                "QF",
+                "SF",
+                "Final",
+            ]
+
+            shown_ids = set()
+
+            for round_name in round_order:
+                rows = [
+                    b
+                    for b in de_bouts
+                    if clean_text(b.get("round_name")) == round_name
+                ]
+
+                if not rows:
+                    continue
+
+                st.markdown(f"**{round_name}**")
+
+                for bout in rows:
+                    shown_ids.add(bout["id"])
+
+                    a = bout.get("fencer_a")
+                    b = bout.get("fencer_b")
+
+                    a_name = a["name"] if a else "Unknown"
+                    b_name = b["name"] if b else "Unknown"
+
+                    st.write(
+                        f"{a_name} "
+                        f"**{bout['score_a']}–{bout['score_b']}** "
+                        f"{b_name}"
+                    )
+
+            other_de = [
+                b
+                for b in de_bouts
+                if b["id"] not in shown_ids
+            ]
+
+            if other_de:
+                st.markdown("**Other DE rounds**")
+                for bout in other_de:
+                    a = bout.get("fencer_a")
+                    b = bout.get("fencer_b")
+
+                    a_name = a["name"] if a else "Unknown"
+                    b_name = b["name"] if b else "Unknown"
+
+                    st.write(
+                        f"{clean_text(bout.get('round_name')) or 'DE'}: "
+                        f"{a_name} "
+                        f"**{bout['score_a']}–{bout['score_b']}** "
+                        f"{b_name}"
+                    )
+
+            if not de_bouts:
+                st.caption("No DE bouts entered.")
+
+            st.divider()
+            st.subheader("Final results")
+
+            placed = [
+                row
+                for row in competition_fencers
+                if row.get("final_place") is not None
+            ]
+
+            placed.sort(
+                key=lambda row: (
+                    row["final_place"],
+                    row.get("person", {}).get("name", ""),
+                )
+            )
+
+            if not placed:
+                st.caption("No final placings entered.")
+            else:
+                for row in placed:
+                    person = row.get("person")
+                    if not person:
+                        continue
+
+                    place_label = (
+                        row.get("final_place_label")
+                        or str(row["final_place"])
+                    )
+
+                    st.write(
+                        f"**{place_label}.** {person['name']}"
+                    )
+
+            # ------------------------------------------------
+            # MANUAL ADD BOUT FALLBACK
+            # ------------------------------------------------
+
+            st.divider()
+
+            with st.expander("Manual result entry"):
+                if len(competition_fencers) < 2:
+                    st.info("Add/import at least two fencers first.")
+                else:
+                    fencer_name_to_id = {
+                        row["person"]["name"]: row["opponent_id"]
+                        for row in competition_fencers
+                        if row.get("person")
+                    }
+
+                    fencer_names = list(fencer_name_to_id.keys())
+
+                    with st.form(
+                        "manual_comp_bout",
+                        clear_on_submit=True,
+                    ):
+                        stage = st.selectbox(
+                            "Stage",
+                            ["Poule", "DE"],
+                        )
+
+                        poule_number = st.number_input(
+                            "Poule number (use 0 for DE)",
+                            min_value=0,
+                            value=1,
+                            step=1,
+                        )
+
+                        round_name = st.text_input(
+                            "DE round",
+                            placeholder="e.g. T16, T8, SF, Final",
+                        )
+
+                        fencer_a = st.selectbox(
+                            "Fencer A",
+                            fencer_names,
+                            key="manual_result_a",
+                        )
+
+                        fencer_b = st.selectbox(
+                            "Fencer B",
+                            fencer_names,
+                            index=1 if len(fencer_names) > 1 else 0,
+                            key="manual_result_b",
+                        )
+
+                        score_a = st.number_input(
+                            "Score A",
+                            min_value=0,
+                            max_value=50,
+                            value=5,
+                            step=1,
+                        )
+
+                        score_b = st.number_input(
+                            "Score B",
+                            min_value=0,
+                            max_value=50,
+                            value=3,
+                            step=1,
+                        )
+
+                        save_manual_result = st.form_submit_button(
+                            "Save result",
+                            type="primary",
+                        )
+
+                    if save_manual_result:
+                        if fencer_a == fencer_b:
+                            st.error("Choose two different fencers.")
+                        else:
+                            supabase.table("competition_bouts").insert({
+                                "competition_id": competition_id,
+                                "fencer_a_id": fencer_name_to_id[fencer_a],
+                                "fencer_b_id": fencer_name_to_id[fencer_b],
+                                "score_a": int(score_a),
+                                "score_b": int(score_b),
+                                "stage": stage,
+                                "poule_number": (
+                                    int(poule_number)
+                                    if stage == "Poule"
+                                    else None
+                                ),
+                                "round_name": (
+                                    round_name.strip()
+                                    if stage == "DE"
+                                    else None
+                                ),
+                            }).execute()
+
+                            st.success("Result saved.")
+                            st.rerun()
 
 
 # ============================================================
@@ -1605,342 +1927,111 @@ elif page == "👤 Opponents":
 # ============================================================
 
 elif page == "📚 Session History":
-
-    st.header(
-        "Session History"
-    )
+    st.header("Session History")
 
     sessions = (
         supabase
         .table("sessions")
         .select("*")
-        .not_.is_(
-            "ended_at",
-            "null"
-        )
-        .order(
-            "session_date",
-            desc=True
-        )
+        .not_.is_("ended_at", "null")
+        .order("session_date", desc=True)
         .execute()
         .data
     )
 
     if not sessions:
-
-        st.info(
-            "No completed "
-            "sessions yet."
-        )
-
+        st.info("No completed sessions yet.")
     else:
-
         session_lookup = {}
 
-        for session in (
-            sessions
-        ):
-
+        for session in sessions:
             label = (
-                f"{session['session_date']}"
-                f" • "
-                f"{session['session_type']}"
-                f" • "
+                f"{session['session_date']} • "
+                f"{session['session_type']} • "
                 f"{session['weapon']}"
             )
 
-            if session.get(
-                "location"
-            ):
+            if session.get("location"):
+                label += f" • {session['location']}"
 
-                label += (
-                    f" • "
-                    f"{session['location']}"
-                )
+            session_lookup[label] = session
 
-            session_lookup[
-                label
-            ] = session
-
-        selected_label = (
-            st.selectbox(
-                "Select session",
-                list(
-                    session_lookup.keys()
-                )
-            )
+        selected_label = st.selectbox(
+            "Select session",
+            list(session_lookup.keys()),
         )
 
-        selected_session = (
-            session_lookup[
-                selected_label
-            ]
-        )
+        selected_session = session_lookup[selected_label]
 
         st.divider()
-
-        st.header(
-            selected_label
-        )
+        st.header(selected_label)
 
         session_bouts = (
             supabase
             .table("bouts")
-            .select(
-                "*, opponents(name)"
-            )
-            .eq(
-                "session_id",
-                selected_session[
-                    "id"
-                ]
-            )
-            .order(
-                "created_at"
-            )
+            .select("*")
+            .eq("session_id", selected_session["id"])
+            .order("created_at")
             .execute()
             .data
         )
 
-        wins = 0
-        losses = 0
-        draws = 0
+        people = opponent_map()
 
-        touches_for = 0
-        touches_against = 0
+        wins = losses = 0
+        touches_for = touches_against = 0
 
-        for bout in (
-            session_bouts
-        ):
+        for bout in session_bouts:
+            touches_for += bout["my_score"]
+            touches_against += bout["opponent_score"]
 
-            touches_for += (
-                bout[
-                    "my_score"
-                ]
-            )
-
-            touches_against += (
-                bout[
-                    "opponent_score"
-                ]
-            )
-
-            if (
-                bout[
-                    "my_score"
-                ]
-                >
-                bout[
-                    "opponent_score"
-                ]
-            ):
-
+            if bout["my_score"] > bout["opponent_score"]:
                 wins += 1
-
-            elif (
-                bout[
-                    "my_score"
-                ]
-                <
-                bout[
-                    "opponent_score"
-                ]
-            ):
-
+            elif bout["my_score"] < bout["opponent_score"]:
                 losses += 1
 
-            else:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Bouts", len(session_bouts))
+        col2.metric("Record", f"{wins}–{losses}")
+        col3.metric("Indicator", f"{touches_for - touches_against:+d}")
 
-                draws += 1
-
-        col1, col2, col3 = (
-            st.columns(3)
-        )
-
-        with col1:
-
-            st.metric(
-                "Bouts",
-                len(
-                    session_bouts
-                )
-            )
-
-        with col2:
-
-            st.metric(
-                "Record",
-                f"{wins}–{losses}"
-            )
-
-        with col3:
-
-            indicator = (
-                touches_for
-                -
-                touches_against
-            )
-
-            st.metric(
-                "Indicator",
-                f"{indicator:+d}"
-            )
-
-        # ----------------------------------------------------
-        # SESSION NOTES
-        # ----------------------------------------------------
-
-        if selected_session.get(
-            "overall_rating"
-        ):
-
+        if selected_session.get("overall_rating"):
             st.write(
-                "**Overall rating:** "
-                f"{selected_session['overall_rating']}"
-                f"/10"
+                f"**Overall rating:** "
+                f"{selected_session['overall_rating']}/10"
             )
 
-        if selected_session.get(
-            "energy_before"
-        ):
+        if selected_session.get("what_i_learned"):
+            st.subheader("What I learned")
+            st.write(selected_session["what_i_learned"])
 
-            st.write(
-                "**Starting energy:** "
-                f"{selected_session['energy_before']}"
-                f"/10"
-            )
+        if selected_session.get("what_to_work_on"):
+            st.subheader("What to work on")
+            st.write(selected_session["what_to_work_on"])
 
-        if selected_session.get(
-            "confidence_before"
-        ):
-
-            st.write(
-                "**Starting confidence:** "
-                f"{selected_session['confidence_before']}"
-                f"/10"
-            )
-
-        if selected_session.get(
-            "what_i_learned"
-        ):
-
-            st.subheader(
-                "What I learned"
-            )
-
-            st.write(
-                selected_session[
-                    "what_i_learned"
-                ]
-            )
-
-        if selected_session.get(
-            "what_to_work_on"
-        ):
-
-            st.subheader(
-                "What to work on"
-            )
-
-            st.write(
-                selected_session[
-                    "what_to_work_on"
-                ]
-            )
-
-        if selected_session.get(
-            "session_notes"
-        ):
-
-            st.subheader(
-                "Session diary"
-            )
-
-            st.write(
-                selected_session[
-                    "session_notes"
-                ]
-            )
-
-        # ----------------------------------------------------
-        # SESSION BOUTS
-        # ----------------------------------------------------
+        if selected_session.get("session_notes"):
+            st.subheader("Session diary")
+            st.write(selected_session["session_notes"])
 
         st.divider()
+        st.subheader("Bouts")
 
-        st.subheader(
-            "Bouts"
-        )
+        for bout in session_bouts:
+            person = people.get(bout["opponent_id"])
+            opponent = person["name"] if person else "Unknown"
 
-        if not session_bouts:
-
-            st.info(
-                "No bouts recorded "
-                "in this session."
+            result = get_result_icon(
+                bout["my_score"],
+                bout["opponent_score"],
             )
 
-        else:
+            st.write(
+                f"**{result} {bout['my_score']}–{bout['opponent_score']}** "
+                f"vs {opponent}"
+            )
 
-            for bout in (
-                session_bouts
-            ):
-
-                opponent_data = (
-                    bout.get(
-                        "opponents"
-                    )
-                )
-
-                if opponent_data:
-
-                    opponent = (
-                        opponent_data[
-                            "name"
-                        ]
-                    )
-
-                else:
-
-                    opponent = (
-                        "Unknown"
-                    )
-
-                my_score = (
-                    bout[
-                        "my_score"
-                    ]
-                )
-
-                their_score = (
-                    bout[
-                        "opponent_score"
-                    ]
-                )
-
-                result = (
-                    get_result_icon(
-                        my_score,
-                        their_score
-                    )
-                )
-
-                st.write(
-                    f"**{result} "
-                    f"{my_score}–"
-                    f"{their_score}** "
-                    f"vs "
-                    f"{opponent}"
-                )
-
-                if bout.get(
-                    "notes"
-                ):
-
-                    st.caption(
-                        bout[
-                            "notes"
-                        ]
-                    )
+            if bout.get("notes"):
+                st.caption(bout["notes"])
 
 
 # ============================================================
@@ -1948,127 +2039,46 @@ elif page == "📚 Session History":
 # ============================================================
 
 elif page == "📖 Bout History":
+    st.header("Bout History")
 
-    st.header(
-        "Bout History"
-    )
-
-    bouts = (
-        get_bouts()
-    )
+    bouts = get_bouts()
 
     if not bouts:
-
-        st.info(
-            "No bouts recorded yet."
-        )
-
+        st.info("No bouts recorded yet.")
     else:
-
         for bout in bouts:
+            person = bout.get("opponent")
+            opponent = person["name"] if person else "Unknown"
 
-            opponent_data = (
-                bout.get(
-                    "opponents"
-                )
-            )
-
-            if opponent_data:
-
-                opponent = (
-                    opponent_data[
-                        "name"
-                    ]
-                )
-
-            else:
-
-                opponent = (
-                    "Unknown opponent"
-                )
-
-            my_score = (
-                bout[
-                    "my_score"
-                ]
-            )
-
-            their_score = (
-                bout[
-                    "opponent_score"
-                ]
-            )
-
-            result = (
-                get_result_icon(
-                    my_score,
-                    their_score
-                )
+            result = get_result_icon(
+                bout["my_score"],
+                bout["opponent_score"],
             )
 
             st.subheader(
-                f"{result} "
-                f"{my_score}–"
-                f"{their_score} "
-                f"vs "
-                f"{opponent}"
+                f"{result} {bout['my_score']}–{bout['opponent_score']} "
+                f"vs {opponent}"
             )
 
-            if bout.get(
-                "created_at"
-            ):
+            if bout.get("created_at"):
+                st.caption(bout["created_at"][:10])
 
-                created = (
-                    bout[
-                        "created_at"
-                    ][:10]
-                )
-
-                st.caption(
-                    created
-                )
-
-            if bout.get(
-                "feeling"
-            ) is not None:
-
+            if bout.get("feeling") is not None:
                 st.write(
-                    "**How well I fenced:** "
-                    f"{bout['feeling']}/10"
+                    f"**How well I fenced:** {bout['feeling']}/10"
                 )
 
-            if bout.get(
-                "notes"
-            ):
+            if bout.get("notes"):
+                st.write(bout["notes"])
 
+            if bout.get("what_worked"):
                 st.write(
-                    bout[
-                        "notes"
-                    ]
+                    "**Worked:** " + bout["what_worked"]
                 )
 
-            if bout.get(
-                "what_worked"
-            ):
-
+            if bout.get("what_didnt"):
                 st.write(
-                    "**Worked:** "
-                    +
-                    bout[
-                        "what_worked"
-                    ]
-                )
-
-            if bout.get(
-                "what_didnt"
-            ):
-
-                st.write(
-                    "**Didn't work:** "
-                    +
-                    bout[
-                        "what_didnt"
-                    ]
+                    "**Didn't work:** " + bout["what_didnt"]
                 )
 
             st.divider()
