@@ -245,6 +245,13 @@ STRENGTH_K_FACTOR = 32.0
 STRENGTH_DE_MULTIPLIER = 1.20
 STRENGTH_ESTABLISHED_BOUTS = 10
 
+# Recent competitions should describe current strength more strongly
+# than old competitions. The effect of a result decays toward a 25%
+# floor, with a 180-day half-life.
+STRENGTH_RECENCY_HALF_LIFE_DAYS = 180
+STRENGTH_RECENCY_FLOOR = 0.25
+STRENGTH_RECENT_FORM_DAYS = 180
+
 DE_ROUND_ORDER = {
     "T512": 0,
     "T256": 1,
@@ -264,6 +271,61 @@ def expected_score(rating_a, rating_b):
         1.0
         + 10.0 ** ((rating_b - rating_a) / 400.0)
     )
+
+
+def parse_competition_date(value):
+    raw = clean_text(value)
+
+    if not raw:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            raw[:10]
+        ).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def competition_recency_weight(
+    competition_date,
+    reference_date=None,
+):
+    """Return (weight, age_days) for the current-strength model.
+
+    New results receive full weight. Older results decay exponentially
+    toward STRENGTH_RECENCY_FLOOR instead of disappearing completely.
+    """
+    if reference_date is None:
+        reference_date = date.today()
+
+    comp_date = parse_competition_date(
+        competition_date
+    )
+
+    if comp_date is None:
+        return 1.0, 0
+
+    age_days = max(
+        0,
+        (reference_date - comp_date).days,
+    )
+
+    decay = 0.5 ** (
+        age_days
+        / STRENGTH_RECENCY_HALF_LIFE_DAYS
+    )
+
+    weight = (
+        STRENGTH_RECENCY_FLOOR
+        + (
+            1.0
+            - STRENGTH_RECENCY_FLOOR
+        )
+        * decay
+    )
+
+    return weight, age_days
 
 
 def get_all_competition_bouts():
@@ -286,13 +348,16 @@ def strength_batch_update(
     history,
     competition,
     stage_label,
-    multiplier,
+    stage_multiplier,
+    recency_multiplier=1.0,
+    age_days=0,
 ):
     """Apply one rating period.
 
     Poules are treated as one rating period and each DE round is treated
-    as one rating period. This avoids arbitrary rating differences caused
-    by the row order of results inside a poule or DE round.
+    as one rating period. Rating changes are multiplied by both the stage
+    multiplier and a recency multiplier, so current results matter more
+    than old results without deleting historical evidence.
     """
     if not batch:
         return
@@ -322,6 +387,11 @@ def strength_batch_update(
                 "wins": 0,
                 "losses": 0,
                 "draws": 0,
+                "effective_bouts": 0.0,
+                "recent_bouts": 0,
+                "recent_wins": 0,
+                "recent_losses": 0,
+                "recent_draws": 0,
                 "last_competition_date": "",
                 "last_competition_name": "",
             },
@@ -388,7 +458,8 @@ def strength_batch_update(
 
         k = (
             STRENGTH_K_FACTOR
-            * multiplier
+            * stage_multiplier
+            * recency_multiplier
         )
 
         deltas[a_id] += (
@@ -407,15 +478,47 @@ def strength_batch_update(
         stats[a_id]["bouts"] += 1
         stats[b_id]["bouts"] += 1
 
+        # Effective bouts are a confidence measure for current strength.
+        # One recent bout counts as 1.0; an old bout counts less.
+        stats[a_id]["effective_bouts"] += (
+            recency_multiplier
+        )
+        stats[b_id]["effective_bouts"] += (
+            recency_multiplier
+        )
+
+        is_recent = (
+            age_days
+            <= STRENGTH_RECENT_FORM_DAYS
+        )
+
+        if is_recent:
+            stats[a_id]["recent_bouts"] += 1
+            stats[b_id]["recent_bouts"] += 1
+
         if actual_a == 1.0:
             stats[a_id]["wins"] += 1
             stats[b_id]["losses"] += 1
+
+            if is_recent:
+                stats[a_id]["recent_wins"] += 1
+                stats[b_id]["recent_losses"] += 1
+
         elif actual_a == 0.0:
             stats[a_id]["losses"] += 1
             stats[b_id]["wins"] += 1
+
+            if is_recent:
+                stats[a_id]["recent_losses"] += 1
+                stats[b_id]["recent_wins"] += 1
+
         else:
             stats[a_id]["draws"] += 1
             stats[b_id]["draws"] += 1
+
+            if is_recent:
+                stats[a_id]["recent_draws"] += 1
+                stats[b_id]["recent_draws"] += 1
 
         for fencer_id in (a_id, b_id):
             stats[fencer_id][
@@ -449,6 +552,8 @@ def strength_batch_update(
             "stage": stage_label,
             "rating": ratings[fencer_id],
             "change": deltas[fencer_id],
+            "recency_weight": recency_multiplier,
+            "age_days": age_days,
         })
 
 
@@ -457,8 +562,11 @@ def calculate_strength_rankings():
 
     Model:
     - All rated fencers start at 1500.
-    - Poule results use standard Elo K=32.
+    - Poule results use Elo K=32.
     - DE results are weighted 20% more strongly.
+    - Results are recency weighted: newer competitions move current
+      strength more than older competitions.
+    - Old results retain a 25% minimum influence rather than vanishing.
     - Final placings are not separately scored because the individual
       bouts that created those placings are already included.
     - Training/diary bouts are excluded from the strength ranking.
@@ -501,6 +609,8 @@ def calculate_strength_rankings():
 
     results = {}
 
+    reference_date = date.today()
+
     for weapon in (
         "Épée",
         "Foil",
@@ -531,6 +641,15 @@ def calculate_strength_rankings():
 
             competition_count += 1
 
+            recency_multiplier, age_days = (
+                competition_recency_weight(
+                    competition.get(
+                        "competition_date"
+                    ),
+                    reference_date,
+                )
+            )
+
             poule_bouts = [
                 bout
                 for bout in competition_bouts
@@ -548,6 +667,8 @@ def calculate_strength_rankings():
                     competition,
                     "Poules",
                     1.0,
+                    recency_multiplier,
+                    age_days,
                 )
 
                 processed_bouts += len(
@@ -602,6 +723,8 @@ def calculate_strength_rankings():
                     competition,
                     round_key,
                     STRENGTH_DE_MULTIPLIER,
+                    recency_multiplier,
+                    age_days,
                 )
 
                 processed_bouts += len(
@@ -635,6 +758,51 @@ def calculate_strength_rankings():
                 else "Provisional"
             )
 
+            effective_bouts = stat[
+                "effective_bouts"
+            ]
+
+            confidence = (
+                100.0
+                * (
+                    1.0
+                    - 0.5 ** (
+                        effective_bouts / 8.0
+                    )
+                )
+            )
+
+            confidence = min(
+                99.0,
+                confidence,
+            )
+
+            latest_date = stat[
+                "last_competition_date"
+            ]
+
+            last_comp_change = sum(
+                point["change"]
+                for point in history.get(
+                    fencer_id,
+                    [],
+                )
+                if point.get("date")
+                == latest_date
+            )
+
+            recent_bouts = stat[
+                "recent_bouts"
+            ]
+
+            recent_win_rate = (
+                stat["recent_wins"]
+                / recent_bouts
+                * 100
+                if recent_bouts
+                else 0
+            )
+
             leaderboard.append({
                 "fencer_id": fencer_id,
                 "name": person["name"],
@@ -656,6 +824,14 @@ def calculate_strength_rankings():
                 "draws": stat["draws"],
                 "win_rate": win_rate,
                 "status": status,
+                "effective_bouts": effective_bouts,
+                "confidence": confidence,
+                "recent_bouts": recent_bouts,
+                "recent_wins": stat["recent_wins"],
+                "recent_losses": stat["recent_losses"],
+                "recent_draws": stat["recent_draws"],
+                "recent_win_rate": recent_win_rate,
+                "last_comp_change": last_comp_change,
                 "last_competition_date": stat[
                     "last_competition_date"
                 ],
@@ -1270,17 +1446,23 @@ if page == "🏠 Dashboard":
                     st.metric(
                         "Strength",
                         f"{rating_row['rating']:.0f}",
+                        delta=(
+                            f"{rating_row['last_comp_change']:+.0f} "
+                            "last comp"
+                        ),
                     )
 
                 with col_c:
                     st.metric(
-                        "Comp bouts",
-                        rating_row["bouts"],
+                        "Confidence",
+                        f"{rating_row['confidence']:.0f}%",
                     )
 
                 st.caption(
-                    f"{rating_row['wins']}W–"
-                    f"{rating_row['losses']}L • "
+                    f"Recent {STRENGTH_RECENT_FORM_DAYS}d: "
+                    f"{rating_row['recent_wins']}W–"
+                    f"{rating_row['recent_losses']}L • "
+                    f"{rating_row['bouts']} total bouts • "
                     f"{rating_row['status']}"
                 )
 
@@ -1834,18 +2016,24 @@ elif page == "👤 Opponents":
                     st.metric(
                         "Strength",
                         f"{row['rating']:.0f}",
+                        delta=(
+                            f"{row['last_comp_change']:+.0f} "
+                            "last comp"
+                        ),
                     )
 
                 with col3:
                     st.metric(
-                        "Comp bouts",
-                        row["bouts"],
+                        "Confidence",
+                        f"{row['confidence']:.0f}%",
                     )
 
                 st.caption(
-                    f"{row['wins']}W–"
+                    f"Recent {STRENGTH_RECENT_FORM_DAYS}d: "
+                    f"{row['recent_wins']}W–"
+                    f"{row['recent_losses']}L • "
+                    f"Lifetime {row['wins']}W–"
                     f"{row['losses']}L • "
-                    f"{row['win_rate']:.0f}% wins • "
                     f"{row['status']}"
                 )
 
@@ -3182,8 +3370,8 @@ elif page == "📈 Strength Rankings":
     st.header("📈 Strength Rankings")
 
     st.caption(
-        "Beta competition-strength ranking calculated from "
-        "imported poule and direct-elimination bouts."
+        "Current-strength ranking from imported competition results. "
+        "Recent performances count more strongly than older ones."
     )
 
     weapon = st.selectbox(
@@ -3250,6 +3438,21 @@ elif page == "📈 Strength Rankings":
         )
 
         st.write(
+            f"Results are also **recency weighted**. A result from today "
+            f"has 100% influence; the recency component halves every "
+            f"{STRENGTH_RECENCY_HALF_LIFE_DAYS} days and approaches a "
+            f"{STRENGTH_RECENCY_FLOOR:.0%} floor. Old results therefore "
+            "still provide evidence, but recent form drives current strength."
+        )
+
+        st.write(
+            f"The **recent form** record covers the last "
+            f"{STRENGTH_RECENT_FORM_DAYS} days. Confidence is based on "
+            "recency-weighted effective bout volume, so a large amount of "
+            "fresh data produces a more trustworthy current rating."
+        )
+
+        st.write(
             "All poule bouts at a competition are treated as one rating "
             "period, and each DE round is treated as its own rating period. "
             "This prevents the arbitrary row order of a poule sheet from "
@@ -3312,7 +3515,17 @@ elif page == "📈 Strength Rankings":
                     "Rating": round(
                         row["rating"]
                     ),
+                    "Last comp Δ": (
+                        f"{row['last_comp_change']:+.0f}"
+                    ),
+                    "Confidence": (
+                        f"{row['confidence']:.0f}%"
+                    ),
                     "Bouts": row["bouts"],
+                    "Recent": (
+                        f"{row['recent_wins']}W–"
+                        f"{row['recent_losses']}L"
+                    ),
                     "Record": (
                         f"{row['wins']}W–"
                         f"{row['losses']}L"
@@ -3358,9 +3571,7 @@ elif page == "📈 Strength Rankings":
                 ]
             )
 
-            col_a, col_b, col_c = (
-                st.columns(3)
-            )
+            col_a, col_b = st.columns(2)
 
             with col_a:
                 st.metric(
@@ -3372,12 +3583,24 @@ elif page == "📈 Strength Rankings":
                 st.metric(
                     "Strength rating",
                     f"{selected_rating['rating']:.0f}",
+                    delta=(
+                        f"{selected_rating['last_comp_change']:+.0f} "
+                        "last comp"
+                    ),
                 )
+
+            col_c, col_d = st.columns(2)
 
             with col_c:
                 st.metric(
                     "Competition bouts",
                     selected_rating["bouts"],
+                )
+
+            with col_d:
+                st.metric(
+                    "Rating confidence",
+                    f"{selected_rating['confidence']:.0f}%",
                 )
 
             st.write(
@@ -3394,8 +3617,21 @@ elif page == "📈 Strength Rankings":
             )
 
             st.write(
+                f"**Recent {STRENGTH_RECENT_FORM_DAYS}-day form:** "
+                f"{selected_rating['recent_wins']}W–"
+                f"{selected_rating['recent_losses']}L"
+                + (
+                    f"–{selected_rating['recent_draws']}D"
+                    if selected_rating["recent_draws"]
+                    else ""
+                )
+            )
+
+            st.write(
                 f"**Status:** "
-                f"{selected_rating['status']}"
+                f"{selected_rating['status']} • "
+                f"effective bouts "
+                f"{selected_rating['effective_bouts']:.1f}"
             )
 
             if selected_rating.get(
@@ -3468,6 +3704,9 @@ elif page == "📈 Strength Rankings":
                         ),
                         "Change": (
                             f"{point['change']:+.1f}"
+                        ),
+                        "Recency weight": (
+                            f"{point.get('recency_weight', 1.0):.0%}"
                         ),
                     })
 
